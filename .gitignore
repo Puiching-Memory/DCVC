@@ -1,9 +1,50 @@
+# Python
 *.pyc
-.vscode/
-*.bin
-*.png
-*.so
-build/
-*.tar
+__pycache__/
 *.pyd
 *.egg-info
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Archives / data dumps
+*.bin
+*.png
+*.tar
+
+# Shared libraries
+*.so
+*.dll
+*.dylib
+
+# Build directories
+build/
+build_msvc/
+cmake-build-*/
+out/
+Debug/
+Release/
+x64/
+Win32/
+
+# Native object / library / binary artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# Generated native assets (keep directory placeholders)
+native/assets/engines/*
+!native/assets/engines/.gitkeep
+native/assets/qp/*
+!native/assets/qp/.gitkeep
