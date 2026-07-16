@@ -373,3 +373,168 @@ extern "C" void dcvc_k_elem_mul(const __half* a, const __half* b, __half* out,
     int g, blk; launch_config(N, g, blk);
     elem_mul_k<<<g, blk, 0, stream>>>(a, b, out, N);
 }
+
+// ===========================================================================
+// 14. pixel_unshuffle_8:  out[192, H/8, W/8] = unshuffle(x[3, H, W], 8)
+//     out[c*64+i*8+j, fh, fw] = x[c, fh*8+i, fw*8+j]
+// ===========================================================================
+__global__ void pixel_unshuffle_8_k(const __half* __restrict__ x,
+                                    __half* __restrict__ out,
+                                    int H, int W) {
+    int fW = W / 8, fH = H / 8;
+    int fHW = fH * fW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = 192 * fHW;
+    if (idx >= total) return;
+    int c_out = idx / fHW;       // 0..191
+    int rem = idx % fHW;
+    int fh = rem / fW;
+    int fw = rem % fW;
+    int c = c_out / 64;          // 0,1,2
+    int i = (c_out % 64) / 8;    // 0..7
+    int j = c_out % 8;           // 0..7
+    int oh = fh * 8 + i;
+    int ow = fw * 8 + j;
+    out[idx] = x[c * H * W + oh * W + ow];
+}
+
+extern "C" void dcvc_k_pixel_unshuffle_8(const __half* x, __half* out,
+                                         int H, int W, cudaStream_t stream) {
+    int g, b; launch_config(192 * (H/8) * (W/8), g, b);
+    pixel_unshuffle_8_k<<<g, b, 0, stream>>>(x, out, H, W);
+}
+
+// ===========================================================================
+// 15. mul_qfeat_broadcast:  out[c, i] = x[c, i] * q[c]  (channel-broadcast)
+// ===========================================================================
+__global__ void mul_qfeat_broadcast_k(const __half* __restrict__ x,
+                                      const __half* __restrict__ q,
+                                      __half* __restrict__ out,
+                                      int C, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C * HW) return;
+    int c = idx / HW;
+    out[idx] = __float2half_rn(__half2float(x[idx]) * __half2float(q[c]));
+}
+
+extern "C" void dcvc_k_mul_qfeat_broadcast(const __half* x, const __half* q,
+                                           __half* out, int C, int HW,
+                                           cudaStream_t stream) {
+    int g, b; launch_config(C * HW, g, b);
+    mul_qfeat_broadcast_k<<<g, b, 0, stream>>>(x, q, out, C, HW);
+}
+
+// ===========================================================================
+// 16. broadcast_mul:  out[ch, i] = in[ch, i] * q[i]  (q broadcast across ch)
+// ===========================================================================
+__global__ void broadcast_mul_k(const __half* __restrict__ in,
+                                const __half* __restrict__ q,
+                                __half* __restrict__ out,
+                                int nc, int hw) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nc * hw) return;
+    int i = idx % hw;
+    out[idx] = __float2half_rn(__half2float(in[idx]) * __half2float(q[i]));
+}
+
+extern "C" void dcvc_k_broadcast_mul(const __half* in, const __half* q,
+                                     __half* out, int nc, int hw,
+                                     cudaStream_t stream) {
+    int g, b; launch_config(nc * hw, g, b);
+    broadcast_mul_k<<<g, b, 0, stream>>>(in, q, out, nc, hw);
+}
+
+// ===========================================================================
+// 17. add_inplace:  out[i] += step[i]
+// ===========================================================================
+__global__ void add_inplace_k(__half* out, const __half* step, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    out[i] = __float2half_rn(__half2float(out[i]) + __half2float(step[i]));
+}
+
+extern "C" void dcvc_k_add_inplace(__half* out, const __half* step,
+                                   int N, cudaStream_t stream) {
+    int g, b; launch_config(N, g, b);
+    add_inplace_k<<<g, b, 0, stream>>>(out, step, N);
+}
+
+// ===========================================================================
+// 18. separate_prior_intra:  pf[514, HW] → q_enc[HW], q_dec[HW] (sigmoid)
+//     sigmoid(x) * 1.5 + 0.5  on pf[0], pf[1]
+// ===========================================================================
+__global__ void separate_prior_intra_k(const __half* __restrict__ pf,
+                                       __half* __restrict__ q_enc,
+                                       __half* __restrict__ q_dec,
+                                       int HW) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= HW) return;
+    float v0 = __half2float(pf[i]);
+    float v1 = __half2float(pf[HW + i]);
+    float s0 = 1.0f / (1.0f + expf(-v0)) * 1.5f + 0.5f;
+    float s1 = 1.0f / (1.0f + expf(-v1)) * 1.5f + 0.5f;
+    q_enc[i] = __float2half_rn(s0);
+    q_dec[i] = __float2half_rn(s1);
+}
+
+extern "C" void dcvc_k_separate_prior_intra(const __half* pf, __half* q_enc,
+                                            __half* q_dec, int HW,
+                                            cudaStream_t stream) {
+    int g, b; launch_config(HW, g, b);
+    separate_prior_intra_k<<<g, b, 0, stream>>>(pf, q_enc, q_dec, HW);
+}
+
+// ===========================================================================
+// 19. separate_prior_video_enc:  params[3*nc, HW] → qdec[nc,HW], scales, means
+//     Pure split (no clamp).
+// ===========================================================================
+extern "C" void dcvc_k_separate_prior_video_enc(const __half* params,
+                                                __half* qdec, __half* scales,
+                                                __half* means, int nc, int HW,
+                                                cudaStream_t stream) {
+    size_t bw = (size_t)nc * HW * 2;
+    cudaMemcpyAsync(qdec,   params,                bw, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(scales, params + (size_t)nc * HW, bw, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(means,  params + (size_t)2 * nc * HW, bw, cudaMemcpyDeviceToDevice, stream);
+}
+
+// ===========================================================================
+// 20. separate_prior_video_dec:  same split but clamp qdec to >= 0.5
+// ===========================================================================
+__global__ void separate_prior_video_dec_k(const __half* __restrict__ params,
+                                          __half* __restrict__ qdec,
+                                          int nc, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nc * HW) return;
+    float v = __half2float(params[idx]);
+    if (v < 0.5f) v = 0.5f;
+    qdec[idx] = __float2half_rn(v);
+}
+
+extern "C" void dcvc_k_separate_prior_video_dec(const __half* params,
+                                                __half* qdec, __half* scales,
+                                                __half* means, int nc, int HW,
+                                                cudaStream_t stream) {
+    int g, b; launch_config(nc * HW, g, b);
+    separate_prior_video_dec_k<<<g, b, 0, stream>>>(params, qdec, nc, HW);
+    size_t bw = (size_t)nc * HW * 2;
+    cudaMemcpyAsync(scales, params + (size_t)nc * HW, bw, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(means,  params + (size_t)2 * nc * HW, bw, cudaMemcpyDeviceToDevice, stream);
+}
+
+// ===========================================================================
+// 21. int8_to_fp16:  out[i] = __float2half_rn((float)in[i])
+//     Converts rANS decoded int8 symbols to FP16 on device.
+// ===========================================================================
+__global__ void int8_to_fp16_k(const int8_t* __restrict__ in,
+                               __half* __restrict__ out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    out[i] = __float2half_rn((float)in[i]);
+}
+
+extern "C" void dcvc_k_int8_to_fp16(const int8_t* in, __half* out,
+                                    int N, cudaStream_t stream) {
+    int g, b; launch_config(N, g, b);
+    int8_to_fp16_k<<<g, b, 0, stream>>>(in, out, N);
+}

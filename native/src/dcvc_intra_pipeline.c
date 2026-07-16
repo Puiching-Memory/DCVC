@@ -296,7 +296,6 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         st = run_engine_io2(eng, in0, img_dims, (void*)d_image,
                             in1, q_dims, g_state.d_qenc, g_state.d_y);
         if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 2: intra_hyper_enc: y → z [1,128,H/64,W/64] */
@@ -305,15 +304,13 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         if (!eng) return st;
         int32_t y_dims[4] = {1, N, g_state.yh, g_state.yw};
         st = run_engine_io2(eng, "in0", y_dims, g_state.d_y, NULL, NULL, NULL, g_state.d_z);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 3: round_to_int8: z → z_hat (fp16) + z_int8 */
     if (!g_state.k_round_to_int8) return DCVC_RT_ERR_IO;
     {
         int z_total = ZC * zhw;
-        g_state.k_round_to_int8(g_state.d_z, g_state.d_zhat, (int8_t*)g_state.d_z_int8, z_total, 0);
+       g_state.k_round_to_int8(g_state.d_z, g_state.d_zhat, (int8_t*)g_state.d_z_int8, z_total, 0);
         cudaDeviceSynchronize();
         cudaMemcpy(g_state.z_int8_h, g_state.d_z_int8, z_total, cudaMemcpyDeviceToHost);
     }
@@ -321,6 +318,8 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
     /* Step 4: z rANS encode */
     {
         int z_total = ZC * zhw;
+        /* Reset pending symbol list each frame; CDFs persist in the encoder. */
+        dcvc_rans_encoder_reset(rans_enc);
         int per_channel = zhw; /* zh * zw */
         int start_offset = qp * ZC;
         dcvc_rans_encoder_encode_z(rans_enc, g_state.z_int8_h, z_total, 0, start_offset, per_channel);
@@ -333,8 +332,6 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         if (!eng) return st;
         int32_t z_dims[4] = {1, ZC, g_state.zh, g_state.zw};
         st = run_engine_io2(eng, "in0", z_dims, g_state.d_zhat, NULL, NULL, NULL, g_state.d_params);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 6: y_prior_fusion: params → params_fusion [1,514,H/16,W/16] */
@@ -343,8 +340,6 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         if (!eng) return st;
         int32_t p_dims[4] = {1, N, g_state.yh, g_state.yw};
         st = run_engine_io2(eng, "in0", p_dims, g_state.d_params, NULL, NULL, NULL, g_state.d_params_fusion);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 7: AR codec encode: y + params_fusion → y bitstream + optional y_hat */
@@ -398,8 +393,6 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
                     in_idx++;
                 }
             }
-            run_engine_io2(eng, in0, yhat_dims, d_yhat, in1, qd_dims, g_state.d_qdec, d_xhat_out);
-            cudaDeviceSynchronize();
         }
         cudaFree(d_yhat);
     }
@@ -462,8 +455,6 @@ DcvcRtStatus dcvc_intra_decode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         if (!eng) return st;
         int32_t z_dims[4] = {1, ZC, g_state.zh, g_state.zw};
         st = run_engine_io2(eng, "in0", z_dims, g_state.d_zhat, NULL, NULL, NULL, g_state.d_params);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 3: y_prior_fusion: params → params_fusion */
@@ -472,8 +463,6 @@ DcvcRtStatus dcvc_intra_decode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         if (!eng) return st;
         int32_t p_dims[4] = {1, N, g_state.yh, g_state.yw};
         st = run_engine_io2(eng, "in0", p_dims, g_state.d_params, NULL, NULL, NULL, g_state.d_params_fusion);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     /* Step 4: AR codec decode: params_fusion → y_hat */
@@ -506,8 +495,6 @@ DcvcRtStatus dcvc_intra_decode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         }
         st = run_engine_io2(eng, in0, yhat_dims, d_yhat_buf, in1, qd_dims, g_state.d_qdec, d_xhat_out);
         cudaFree(d_yhat_buf);
-        if (st != DCVC_RT_OK) return st;
-        cudaDeviceSynchronize();
     }
 
     return DCVC_RT_OK;

@@ -45,6 +45,8 @@ static float h2f(uint16_t h)
 }
 
 typedef void (*fn_round_to_int8)(const void*, void*, int8_t*, int, cudaStream_t);
+typedef void (*fn_pixel_unshuffle_8)(const void*, void*, int, int, cudaStream_t);
+typedef void (*fn_mul_qfeat_broadcast)(const void*, const void*, void*, int, int, cudaStream_t);
 
 /* ---- Minimal npy reader (int32 + fp16) ---- */
 typedef struct { int dims[4]; size_t elems; int32_t* i32; uint16_t* fp16; } PnNpy;
@@ -83,24 +85,7 @@ static int pn_read_npy(const char* path, PnNpy* o)
 }
 
 /* ---- pixel_unshuffle(frame[1,3,H,W], 8) → [1,192,H/8,W/8] ---- */
-static void pixel_unshuffle_8(const void* d_frame, int H, int W, void* d_out)
-{
-    int fH = H / 8, fW = W / 8;
-    uint16_t* in = malloc(3 * H * W * 2);
-    uint16_t* out = malloc(192 * fH * fW * 2);
-    cudaMemcpy(in, d_frame, 3 * H * W * 2, cudaMemcpyDeviceToHost);
-    for (int c = 0; c < 3; c++)
-        for (int i = 0; i < 8; i++)
-            for (int j = 0; j < 8; j++) {
-                int co = c * 64 + i * 8 + j;
-                for (int fh = 0; fh < fH; fh++)
-                    for (int fw = 0; fw < fW; fw++)
-                        out[co * fH * fW + fh * fW + fw] =
-                            in[c * H * W + (fh * 8 + i) * W + (fw * 8 + j)];
-            }
-    cudaMemcpy(d_out, out, 192 * fH * fW * 2, cudaMemcpyHostToDevice);
-    free(in); free(out);
-}
+/* GPU pixel_unshuffle: inline kernel call (struct must be defined first) */
 
 /* ---- Engine binding helpers ---- */
 static const char* eng_out_name(DcvcTrtEngine* eng)
@@ -160,13 +145,14 @@ struct DcvcInterPipeline {
     DcvcTrtEngine* eng[INTER_N_ENG];
     void* kernel_so;
     fn_round_to_int8 k_round_to_int8;
+    fn_pixel_unshuffle_8 k_pixel_unshuffle_8;
+    fn_mul_qfeat_broadcast k_mul_qfeat_broadcast;
     int H, W, fH, fW, yH, yW, zH, zW;
     void *d_feature, *d_pixunshuf, *d_x1, *d_ctx_t, *d_ctx, *d_y, *d_z, *d_zhat, *d_z_int8;
     void *d_hier, *d_temporal, *d_pf_in, *d_params, *d_yhat, *d_fdec;
     void *d_q_enc, *d_q_dec, *d_q_feat, *d_q_recon, *d_q_ones;
     int8_t* z_int8_h;
     uint16_t* z_hat_h;
-    uint16_t* q_feat_h;
 };
 enum { E_FADAP_P, E_FADAP_I, E_FE1, E_FE2, E_ENC, E_HENC, E_HDEC, E_TEMP, E_PFUS, E_DEC, E_RECON };
 static const char* k_eng_files[INTER_N_ENG] = {
@@ -184,7 +170,7 @@ static void ips_free_bufs(DcvcInterPipeline* p)
     cudaFree(p->d_params); cudaFree(p->d_yhat); cudaFree(p->d_fdec);
     cudaFree(p->d_q_enc); cudaFree(p->d_q_dec); cudaFree(p->d_q_feat);
     cudaFree(p->d_q_recon); cudaFree(p->d_q_ones);
-    free(p->z_int8_h); free(p->z_hat_h); free(p->q_feat_h);
+    free(p->z_int8_h); free(p->z_hat_h);
     p->d_feature = NULL;
 }
 
@@ -221,7 +207,6 @@ static DcvcRtStatus ips_ensure(DcvcInterPipeline* p, int H, int W)
     cudaMalloc(&p->d_q_ones,   D * 2);
     p->z_int8_h = malloc(ZC * zHW);
     p->z_hat_h  = malloc(ZC * zHW * 2);
-    p->q_feat_h = malloc(D * 2);
 
     void* ptrs[] = {p->d_feature,p->d_pixunshuf,p->d_x1,p->d_ctx_t,p->d_ctx,p->d_y,p->d_z,
         p->d_zhat,p->d_z_int8,p->d_hier,p->d_temporal,p->d_pf_in,p->d_params,p->d_yhat,p->d_fdec,
@@ -245,7 +230,7 @@ static DcvcRtStatus build_ref_feature(DcvcInterPipeline* p, const void* d_ref_fe
         return run1(p->eng[E_FADAP_P], "in0", d, (void*)d_ref_feature, p->d_feature);
     }
     /* P-after-I: pixel_unshuffle then adaptor_i */
-    pixel_unshuffle_8(d_ref_pixels, H, W, p->d_pixunshuf);
+    p->k_pixel_unshuffle_8(d_ref_pixels, p->d_pixunshuf, H, W, 0);
     int32_t d[4] = {1, SRC, fH, fW};
     return run1(p->eng[E_FADAP_I], "in0", d, p->d_pixunshuf, p->d_feature);
 }
@@ -297,16 +282,8 @@ static DcvcRtStatus load_z_cdfs(DcvcInterPipeline* p, int enc, void* r)
 static void mul_qfeat_broadcast(DcvcInterPipeline* p)
 {
     int D = DCVC_RT_CH_D, fHW = p->fH * p->fW;
-    uint16_t* x1 = malloc(D * fHW * 2);
-    cudaMemcpy(x1, p->d_x1, D * fHW * 2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(p->q_feat_h, p->d_q_feat, D * 2, cudaMemcpyDeviceToHost);
-    for (int c = 0; c < D; c++) {
-        float q = h2f(p->q_feat_h[c]);
-        for (int i = 0; i < fHW; i++)
-            x1[c * fHW + i] = f32h(h2f(x1[c * fHW + i]) * q);
-    }
-    cudaMemcpy(p->d_ctx_t, x1, D * fHW * 2, cudaMemcpyHostToDevice);
-    free(x1);
+    /* GPU: ctx_t = x1 * q_feat (channel-broadcast multiply, no host round-trip) */
+    p->k_mul_qfeat_broadcast(p->d_x1, p->d_q_feat, p->d_ctx_t, D, fHW, 0);
 }
 
 DcvcInterPipeline* dcvc_inter_pipeline_create(const char* asset_dir,
@@ -324,6 +301,9 @@ DcvcInterPipeline* dcvc_inter_pipeline_create(const char* asset_dir,
     if (!p->kernel_so) { st = DCVC_RT_ERR_IO; goto fail; }
     p->k_round_to_int8 = (fn_round_to_int8)dlsym(p->kernel_so, "dcvc_k_round_to_int8");
     if (!p->k_round_to_int8) { st = DCVC_RT_ERR_IO; goto fail; }
+    p->k_pixel_unshuffle_8 = (fn_pixel_unshuffle_8)dlsym(p->kernel_so, "dcvc_k_pixel_unshuffle_8");
+    p->k_mul_qfeat_broadcast = (fn_mul_qfeat_broadcast)dlsym(p->kernel_so, "dcvc_k_mul_qfeat_broadcast");
+    if (!p->k_pixel_unshuffle_8 || !p->k_mul_qfeat_broadcast) { st = DCVC_RT_ERR_IO; goto fail; }
     for (int i = 0; i < INTER_N_ENG; i++) {
         snprintf(path, sizeof(path), "%s/engines/%s.engine", p->asset_dir, k_eng_files[i]);
         p->eng[i] = dcvc_trt_engine_load(path, p->plugin_dir, &st);
@@ -373,28 +353,28 @@ DcvcRtStatus dcvc_inter_encode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
 
     /* 1. ref feature */
     st = build_ref_feature(p, d_ref_feature, d_ref_pixels, H, W);
-    if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize();
+    if (st != DCVC_RT_OK) return st
 
     /* 2. fe1(feature, ones) → x1 ; ctx_t = x1·q_feat */
     { int32_t fd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run2(p->eng[E_FE1], "in0", fd, p->d_feature, "q", qd, p->d_q_ones, p->d_x1);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
     mul_qfeat_broadcast(p);
 
     /* 3. fe2(x1) → ctx */
     { int32_t fd[4]={1,D,fH,fW};
       st = run1(p->eng[E_FE2], "in0", fd, p->d_x1, p->d_ctx);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 4. encoder(x, ctx, q_enc) → y */
     { int32_t xd[4]={1,3,H,W}, cd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run3(p->eng[E_ENC], "x", xd, (void*)d_image, "ctx", cd, p->d_ctx, "q", qd, p->d_q_enc, p->d_y);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 5. hyper_enc(y) → z */
     { int32_t yd[4]={1,YC,yH,yW};
       st = run1(p->eng[E_HENC], "in0", yd, p->d_y, p->d_z);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 6. round_to_int8 */
     { int zt = ZC * zHW;
@@ -404,25 +384,29 @@ DcvcRtStatus dcvc_inter_encode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
 
     /* 7. z rANS encode */
     { int zt = ZC * zHW;
+      /* Reset pending symbol list each frame; CDFs persist in the encoder.
+       * Without this, m_pendingEncodingList accumulates symbols across frames
+       * and the z bitstream is corrupted from the 2nd P-frame onward. */
+      dcvc_rans_encoder_reset(rans_enc);
       dcvc_rans_encoder_encode_z(rans_enc, p->z_int8_h, zt, 0, qp * ZC, zHW);
       dcvc_rans_encoder_flush(rans_enc); }
 
     /* 8. hyper_dec(z_hat) → hier */
     { int32_t zd[4]={1,ZC,zH,zW};
       st = run1(p->eng[E_HDEC], "in0", zd, p->d_zhat, p->d_hier);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 9. temporal_prior(ctx_t) → temporal */
     { int32_t cd[4]={1,D,fH,fW};
       st = run1(p->eng[E_TEMP], "in0", cd, p->d_ctx_t, p->d_temporal);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 10. cat(hier,temporal) → prior_fusion → params */
     { cudaMemcpy(p->d_pf_in, p->d_hier, YC*yHW*2, cudaMemcpyDeviceToDevice);
       cudaMemcpy((char*)p->d_pf_in+(size_t)YC*yHW*2, p->d_temporal, (YC*2)*yHW*2, cudaMemcpyDeviceToDevice);
       int32_t pd[4]={1,YC*3,yH,yW};
       st = run1(p->eng[E_PFUS], "in0", pd, p->d_pf_in, p->d_params);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 11. AR(2x) encode */
     uint8_t* y_stream = NULL; size_t y_stream_size = 0;
@@ -432,13 +416,13 @@ DcvcRtStatus dcvc_inter_encode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
     /* 12. decoder(y_hat, ctx, q_dec) → dec_feature */
     { int32_t yd[4]={1,YC,yH,yW}, cd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run3(p->eng[E_DEC], "in0", yd, p->d_yhat, "ctx", cd, p->d_ctx, "q", qd, p->d_q_dec, p->d_fdec);
-      if (st != DCVC_RT_OK) { free(y_stream); return st; } cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) { free(y_stream); return st; } }
 
     /* 13. optional recon → x_hat */
     if (d_xhat_out) {
         int32_t fd[4]={1,D,fH,fW}, qd[4]={1,RECON,1,1};
         st = run2(p->eng[E_RECON], "in0", fd, p->d_fdec, "q", qd, p->d_q_recon, d_xhat_out);
-        if (st != DCVC_RT_OK) { free(y_stream); return st; } cudaDeviceSynchronize();
+        if (st != DCVC_RT_OK) { free(y_stream); return st; }
     }
     if (d_ref_feature_out)
         cudaMemcpy(d_ref_feature_out, p->d_fdec, D*(fH*fW)*2, cudaMemcpyDeviceToDevice);
@@ -500,30 +484,30 @@ DcvcRtStatus dcvc_inter_decode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
 
     /* 2. ref feature */
     st = build_ref_feature(p, d_ref_feature, d_ref_pixels, H, W);
-    if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize();
+    if (st != DCVC_RT_OK) return st
 
     /* 3. fe1(feature, ones) → x1 ; ctx_t */
     { int32_t fd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run2(p->eng[E_FE1], "in0", fd, p->d_feature, "q", qd, p->d_q_ones, p->d_x1);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
     mul_qfeat_broadcast(p);
 
     /* 4. hyper_dec(z_hat) → hier */
     { int32_t zd[4]={1,ZC,zH,zW};
       st = run1(p->eng[E_HDEC], "in0", zd, p->d_zhat, p->d_hier);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 5. temporal_prior(ctx_t) → temporal */
     { int32_t cd[4]={1,D,fH,fW};
       st = run1(p->eng[E_TEMP], "in0", cd, p->d_ctx_t, p->d_temporal);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 6. cat → prior_fusion → params */
     { cudaMemcpy(p->d_pf_in, p->d_hier, YC*yHW*2, cudaMemcpyDeviceToDevice);
       cudaMemcpy((char*)p->d_pf_in+(size_t)YC*yHW*2, p->d_temporal, (YC*2)*yHW*2, cudaMemcpyDeviceToDevice);
       int32_t pd[4]={1,YC*3,yH,yW};
       st = run1(p->eng[E_PFUS], "in0", pd, p->d_pf_in, p->d_params);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 7. AR(2x) decode */
     st = dcvc_ar_codec_decode(ar_codec, p->d_params, yH, yW, y_payload, y_size, p->d_yhat);
@@ -532,17 +516,17 @@ DcvcRtStatus dcvc_inter_decode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
     /* 8. fe2(x1) → ctx */
     { int32_t fd[4]={1,D,fH,fW};
       st = run1(p->eng[E_FE2], "in0", fd, p->d_x1, p->d_ctx);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 9. decoder(y_hat, ctx, q_dec) → dec_feature */
     { int32_t yd[4]={1,YC,yH,yW}, cd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run3(p->eng[E_DEC], "in0", yd, p->d_yhat, "ctx", cd, p->d_ctx, "q", qd, p->d_q_dec, p->d_fdec);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     /* 10. recon → x_hat */
     { int32_t fd[4]={1,D,fH,fW}, qd[4]={1,RECON,1,1};
       st = run2(p->eng[E_RECON], "in0", fd, p->d_fdec, "q", qd, p->d_q_recon, d_xhat_out);
-      if (st != DCVC_RT_OK) return st; cudaDeviceSynchronize(); }
+      if (st != DCVC_RT_OK) return st }
 
     if (d_ref_feature_out)
         cudaMemcpy(d_ref_feature_out, p->d_fdec, D*(fH*fW)*2, cudaMemcpyDeviceToDevice);

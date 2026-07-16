@@ -103,6 +103,7 @@ DCVC_RT_API void dcvc_rt_decoder_destroy(DcvcRtDecoder* dec);
 DCVC_RT_API void dcvc_rt_packet_free(DcvcRtPacket* pkt);
 DCVC_RT_API void dcvc_rt_frame_free_planes(DcvcRtFrame* frame);
 
+
 #ifdef __cplusplus
 }
 #endif

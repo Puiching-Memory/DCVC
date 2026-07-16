@@ -85,6 +85,13 @@ typedef void (*fn_sp2x)(const void*, void*, int, cudaStream_t);
 typedef void (*fn_restore_y2x)(const void*, const void*, const void*, void*, int, int, cudaStream_t);
 typedef void (*fn_add_mul)(void*, const void*, const void*, int, cudaStream_t);
 typedef void (*fn_crq)(const void*, const void*, void*, void*, float, int, cudaStream_t);
+/* GPU-accelerated host-replacement kernels */
+typedef void (*fn_separate_prior_intra)(const void*, void*, void*, int, cudaStream_t);
+typedef void (*fn_separate_prior_video_enc)(const void*, void*, void*, void*, int, int, cudaStream_t);
+typedef void (*fn_separate_prior_video_dec)(const void*, void*, void*, void*, int, int, cudaStream_t);
+typedef void (*fn_broadcast_mul)(const void*, const void*, void*, int, int, cudaStream_t);
+typedef void (*fn_add_inplace)(void*, const void*, int, cudaStream_t);
+typedef void (*fn_int8_to_fp16)(const void*, void*, int, cudaStream_t);
 
 /* ---- Persistent workspace ---- */
 typedef struct {
@@ -95,6 +102,13 @@ typedef struct {
     void *d_qenc, *d_qdec, *d_scales, *d_means, *d_common;
     void *d_smask, *d_sr, *d_yq_full, *d_yq_w, *d_packed, *d_indexes;
     void *d_yhat_step, *d_cat, *d_sp_out, *d_yhat;
+    void *d_yq;  /* quantized y output (preserves d_yq_full across AR rounds) */
+    void* d_masks[4];  /* pre-cached AR checkerboard masks (device) */
+    /* Pinned host scratch buffers for rANS symbol transfer (pre-allocated) */
+    void* h_packed;    /* int16_t [r*hw] — encode symbols */
+    void* h_indexes;   /* uint8_t [r*hw] — decode scale indices */
+    void* h_syms_i8;   /* int8_t [r*hw] — decode symbols upload */
+    void* d_syms_i8;   /* device int8_t [r*hw] — symbols for int8→fp16 kernel */
 } ArWorkspace;
 
 struct DcvcArCodec {
@@ -116,6 +130,12 @@ struct DcvcArCodec {
     fn_restore_y2x    k_restore_y2x;
     fn_add_mul        k_add_mul;
     fn_crq            k_crq;
+    fn_separate_prior_intra   k_sep_intra;
+    fn_separate_prior_video_enc k_sep_vid_enc;
+    fn_separate_prior_video_dec k_sep_vid_dec;
+    fn_broadcast_mul  k_broadcast_mul;
+    fn_add_inplace    k_add_inplace;
+    fn_int8_to_fp16   k_int8_to_fp16;
 
     /* TRT engines */
     DcvcTrtEngine* eng_reduction;
@@ -138,6 +158,11 @@ struct DcvcArCodec {
 };
 
 /* ---- Workspace management ---- */
+/* 4x AR checkerboard mask pattern (moved up for ws_ensure pre-caching) */
+static const int k_mask_pattern[4][4] = {
+    {0, 1, 2, 3}, {3, 2, 1, 0}, {2, 3, 0, 1}, {1, 0, 3, 2},
+};
+
 static void ws_free(ArWorkspace* ws)
 {
     if (!ws->hw) return;
@@ -149,6 +174,12 @@ static void ws_free(ArWorkspace* ws)
     cudaFree(ws->d_indexes);  cudaFree(ws->d_yhat_step);
     cudaFree(ws->d_cat);      cudaFree(ws->d_sp_out);
     cudaFree(ws->d_yhat);
+    cudaFree(ws->d_yq);
+    for (int i = 0; i < 4; i++) cudaFree(ws->d_masks[i]);
+    cudaFreeHost(ws->h_packed);
+    cudaFreeHost(ws->h_indexes);
+    cudaFreeHost(ws->h_syms_i8);
+    cudaFree(ws->d_syms_i8);
     memset(ws, 0, sizeof(*ws));
 }
 
@@ -182,15 +213,58 @@ static DcvcRtStatus ws_ensure(DcvcArCodec* c, int H, int W)
     cudaMalloc(&ws->d_cat,      4 * nc * hw * 2);
     cudaMalloc(&ws->d_sp_out,   2 * nc * hw * 2);
     cudaMalloc(&ws->d_yhat,     nc * hw * 2);
+    cudaMalloc(&ws->d_yq,       nc * hw * 2);
 
     /* Check all allocations succeeded */
     void* ptrs[] = {ws->d_qenc, ws->d_qdec, ws->d_scales, ws->d_means, ws->d_common,
                     ws->d_smask, ws->d_sr, ws->d_yq_full, ws->d_yq_w, ws->d_packed,
                     ws->d_indexes, ws->d_yhat_step, ws->d_cat, ws->d_sp_out, ws->d_yhat,
-                    ws->d_yhat};
-    for (int i = 0; i < 15; i++) {
+                    ws->d_yhat, ws->d_yq};
+    for (int i = 0; i < 16; i++) {
         if (!ptrs[i]) { ws_free(ws); return DCVC_RT_ERR_OOM; }
     }
+
+    /* Pre-generate and cache AR checkerboard masks on device (one-time cost).
+     * Masks are deterministic per (round, nc, H, W); cached for reuse across
+     * all frames, eliminating per-round host malloc + H2D. */
+    int n_masks = (c->passes == 4) ? 4 : 2;
+    for (int m = 0; m < n_masks; m++) {
+        uint16_t* mh = (uint16_t*)malloc(nc * hw * 2);
+        if (c->passes == 4) {
+            int q = nc / 4;
+            for (int ch = 0; ch < nc; ch++) {
+                int quarter = ch / q; if (quarter > 3) quarter = 3;
+                int target = k_mask_pattern[m][quarter];
+                for (int hh = 0; hh < H; hh++)
+                    for (int ww = 0; ww < W; ww++) {
+                        int sp = (hh % 2) * 2 + (ww % 2);
+                        mh[ch * hw + hh * W + ww] = (sp == target) ? f32h(1.0f) : f32h(0.0f);
+                    }
+            }
+        } else {
+            int half = nc / 2;
+            for (int ch = 0; ch < nc; ch++) {
+                int half_idx = ch / half;
+                int use_m0 = (m == 0) ? (half_idx == 0) : (half_idx == 1);
+                for (int hh = 0; hh < H; hh++)
+                    for (int ww = 0; ww < W; ww++) {
+                        int is_diag = ((hh % 2) == (ww % 2));
+                        int val = use_m0 ? is_diag : !is_diag;
+                        mh[ch * hw + hh * W + ww] = val ? f32h(1.0f) : f32h(0.0f);
+                    }
+            }
+        }
+        cudaMalloc(&ws->d_masks[m], nc * hw * 2);
+        cudaMemcpy(ws->d_masks[m], mh, nc * hw * 2, cudaMemcpyHostToDevice);
+        free(mh);
+    }
+
+    /* Pre-allocate pinned host scratch + device buffer for rANS transfers */
+    cudaMallocHost(&ws->h_packed, r * hw * 2);     /* int16_t */
+    cudaMallocHost(&ws->h_indexes, r * hw);         /* uint8_t */
+    cudaMallocHost(&ws->h_syms_i8, r * hw);         /* int8_t */
+    cudaMalloc(&ws->d_syms_i8, r * hw);             /* device int8_t */
+
     return DCVC_RT_OK;
 }
 
@@ -214,23 +288,11 @@ static DcvcRtStatus bind_and_run(DcvcTrtEngine* eng, const char* in_name,
 static void separate_prior(DcvcArCodec* c, const void* d_pf, int H, int W)
 {
     int hw = H * W, nc = c->n_ch;
-    size_t pf_bytes = 514 * hw * 2;
-    uint16_t* pf = malloc(pf_bytes);
-    cudaMemcpy((void*)pf, d_pf, pf_bytes, cudaMemcpyDeviceToHost);
-
-    uint16_t* qe = malloc(hw * 2);
-    uint16_t* qd = malloc(hw * 2);
-    for (int i = 0; i < hw; i++) {
-        float v0 = 1.0f / (1.0f + expf(-h2f(pf[0 * hw + i]))) * 1.5f + 0.5f;
-        float v1 = 1.0f / (1.0f + expf(-h2f(pf[1 * hw + i]))) * 1.5f + 0.5f;
-        qe[i] = f32h(v0);
-        qd[i] = f32h(v1);
-    }
-    cudaMemcpy(c->ws.d_qenc, qe, hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_qdec, qd, hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_scales, pf + 2 * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_means, pf + (2 + nc) * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(pf); free(qe); free(qd);
+    /* GPU: sigmoid on pf[0:2] → q_enc, q_dec; D2D copy for scales/means */
+    const uint16_t* pf = (const uint16_t*)d_pf;
+    c->k_sep_intra(d_pf, c->ws.d_qenc, c->ws.d_qdec, hw, 0);
+    cudaMemcpy(c->ws.d_scales, pf + 2 * hw, (size_t)nc * hw * 2, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(c->ws.d_means, pf + (2 + nc) * hw, (size_t)nc * hw * 2, cudaMemcpyDeviceToDevice);
 }
 
 /* ---- Core AR loop: shared by encode and decode ---- */
@@ -265,32 +327,7 @@ static DcvcRtStatus run_spatial_prior(DcvcArCodec* c, void* d_yhat_sf,
     const char* sp_out = dcvc_trt_engine_tensor_name(c->eng_spatial_prior, nio_sp - 1);
     dcvc_trt_engine_set_addr(c->eng_spatial_prior, sp_out, ws->d_cat);
     st = dcvc_trt_engine_execute(c->eng_spatial_prior, NULL);
-    cudaDeviceSynchronize();
     return st;
-}
-
-/* Helper: element-wise add on host (sf += step) */
-static void host_add_inplace(void* d_sf, void* d_step, int n)
-{
-    uint16_t* sf = malloc(n * 2);
-    uint16_t* st = malloc(n * 2);
-    cudaMemcpy(sf, d_sf, n * 2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(st, d_step, n * 2, cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n; i++) sf[i] = f32h(h2f(sf[i]) + h2f(st[i]));
-    cudaMemcpy(d_sf, sf, n * 2, cudaMemcpyHostToDevice);
-    free(sf); free(st);
-}
-
-/* Helper: multiply by q_dec broadcast across channels, in-place on host buffer */
-static void host_mul_qdec(void* d_buf, const uint16_t* qdec_h, int nc, int hw)
-{
-    uint16_t* buf = malloc(nc * hw * 2);
-    cudaMemcpy(buf, d_buf, nc * hw * 2, cudaMemcpyDeviceToHost);
-    for (int c = 0; c < nc; c++)
-        for (int i = 0; i < hw; i++)
-            buf[c * hw + i] = f32h(h2f(buf[c * hw + i]) * h2f(qdec_h[i]));
-    cudaMemcpy(d_buf, buf, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(buf);
 }
 
 DcvcArCodec* dcvc_ar_codec_create(const char* asset_dir, const char* plugin_dir,
@@ -336,6 +373,16 @@ DcvcArCodec* dcvc_ar_codec_create(const char* asset_dir, const char* plugin_dir,
     c->k_restore_y2x = (fn_restore_y2x)dlsym(c->kernel_so, "dcvc_k_restore_y_2x");
     c->k_add_mul     = (fn_add_mul)dlsym(c->kernel_so, "dcvc_k_add_and_multiply");
     c->k_crq         = (fn_crq)dlsym(c->kernel_so, "dcvc_k_clamp_recip_quant");
+    c->k_sep_intra   = (fn_separate_prior_intra)dlsym(c->kernel_so, "dcvc_k_separate_prior_intra");
+    c->k_sep_vid_enc = (fn_separate_prior_video_enc)dlsym(c->kernel_so, "dcvc_k_separate_prior_video_enc");
+    c->k_sep_vid_dec = (fn_separate_prior_video_dec)dlsym(c->kernel_so, "dcvc_k_separate_prior_video_dec");
+    c->k_broadcast_mul = (fn_broadcast_mul)dlsym(c->kernel_so, "dcvc_k_broadcast_mul");
+    c->k_add_inplace = (fn_add_inplace)dlsym(c->kernel_so, "dcvc_k_add_inplace");
+    if (!c->k_sep_intra || !c->k_sep_vid_enc || !c->k_sep_vid_dec ||
+        !c->k_broadcast_mul || !c->k_add_inplace) { st = DCVC_RT_ERR_IO; goto fail; }
+
+    c->k_int8_to_fp16 = (fn_int8_to_fp16)dlsym(c->kernel_so, "dcvc_k_int8_to_fp16");
+    if (!c->k_int8_to_fp16) { st = DCVC_RT_ERR_IO; goto fail; }
 
     /* Load CDFs */
     snprintf(path, sizeof(path), "%s/gaussian_cdf.npy", decode_dir);
@@ -400,100 +447,26 @@ void dcvc_ar_codec_destroy(DcvcArCodec* c)
  *   round 1: quarters [m3, m2, m1, m0] → spatial_pos [3,2,1,0]
  *   round 2: quarters [m2, m3, m0, m1] → spatial_pos [2,3,0,1]
  *   round 3: quarters [m1, m0, m3, m2] → spatial_pos [1,0,3,2]
- * spatial_pos = (h % 2) * 2 + (w % 2)
- * mask[c, h, w] = 1 if spatial_pos == pattern[round][c / (C/4)] */
-static const int k_mask_pattern[4][4] = {
-    {0, 1, 2, 3},
-    {3, 2, 1, 0},
-    {2, 3, 0, 1},
-    {1, 0, 3, 2},
-};
-
-static void* generate_mask(int round, int nc, int H, int W)
-{
-    int hw = H * W, q = nc / 4;
-    uint16_t* mask_h = (uint16_t*)malloc(nc * hw * 2);
-    for (int c = 0; c < nc; c++) {
-        int quarter = c / q;
-        if (quarter > 3) quarter = 3;
-        int target_pos = k_mask_pattern[round][quarter];
-        for (int h = 0; h < H; h++) {
-            for (int w = 0; w < W; w++) {
-                int sp = (h % 2) * 2 + (w % 2);
-                mask_h[c * hw + h * W + w] = (sp == target_pos) ? f32h(1.0f) : f32h(0.0f);
-            }
-        }
-    }
-    void* d_mask;
-    cudaMalloc(&d_mask, nc * hw * 2);
-    cudaMemcpy(d_mask, mask_h, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(mask_h);
-    return d_mask;
-}
-
-
 
 /* ---- 2x separate_prior for video (inter) ---- */
 /* Encode: params.chunk(3) → q_dec, scales, means; y = y / max(q_dec, 0.5) */
 static void separate_prior_video_enc(DcvcArCodec* c, const void* d_params, int H, int W)
 {
     int hw = H * W, nc = c->n_ch;
-    size_t pbytes = (size_t)3 * nc * hw * 2;
-    uint16_t* ph = (uint16_t*)malloc(pbytes);
-    cudaMemcpy(ph, d_params, pbytes, cudaMemcpyDeviceToHost);
-    /* q_dec = first nc channels, scales = next nc, means = last nc */
-    cudaMemcpy(c->ws.d_qdec, ph, nc * hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_scales, ph + nc * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_means, ph + 2 * nc * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(ph);
+    /* GPU: pure device-to-device split (no host round-trip) */
+    c->k_sep_vid_enc(d_params, c->ws.d_qdec,
+                     c->ws.d_scales, c->ws.d_means, nc, hw, 0);
 }
 
 /* Decode: params.chunk(3) → quant_step(clamp≥0.5), scales, means */
 static void separate_prior_video_dec(DcvcArCodec* c, const void* d_params, int H, int W)
 {
     int hw = H * W, nc = c->n_ch;
-    size_t pbytes = (size_t)3 * nc * hw * 2;
-    uint16_t* ph = (uint16_t*)malloc(pbytes);
-    cudaMemcpy(ph, d_params, pbytes, cudaMemcpyDeviceToHost);
-    /* quant_step = first nc channels, clamp to ≥0.5 on host */
-    uint16_t* qd = (uint16_t*)malloc(nc * hw * 2);
-    for (int i = 0; i < nc * hw; i++) {
-        float v = h2f(ph[i]); if (v < 0.5f) v = 0.5f;
-        qd[i] = f32h(v);
-    }
-    cudaMemcpy(c->ws.d_qdec, qd, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(qd);
-    cudaMemcpy(c->ws.d_scales, ph + nc * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->ws.d_means, ph + 2 * nc * hw, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(ph);
+    /* GPU: split with clamp on qdec (no host round-trip) */
+    c->k_sep_vid_dec(d_params, c->ws.d_qdec,
+                     c->ws.d_scales, c->ws.d_means, nc, hw, 0);
 }
 
-/* ---- 2x mask generation (diagonal / anti-diagonal checkerboard) ---- */
-/* m0 = ((1,0),(0,1)): spatial pos where h%2 == w%2 → diag */
-/* m1 = ((0,1),(1,0)): spatial pos where h%2 != w%2 → anti-diag */
-static void* generate_mask_2x(int round, int nc, int H, int W)
-{
-    int hw = H * W, half = nc / 2;
-    uint16_t* mask_h = (uint16_t*)malloc(nc * hw * 2);
-    for (int c = 0; c < nc; c++) {
-        int half_idx = c / half;  /* 0 or 1 */
-        /* round 0: first half gets m0(diag), second half gets m1(anti)
-         * round 1: first half gets m1(anti), second half gets m0(diag) */
-        int use_m0 = (round == 0) ? (half_idx == 0) : (half_idx == 1);
-        for (int h = 0; h < H; h++) {
-            for (int w = 0; w < W; w++) {
-                int is_diag = ((h % 2) == (w % 2));
-                int val = use_m0 ? is_diag : !is_diag;
-                mask_h[c * hw + h * W + w] = val ? f32h(1.0f) : f32h(0.0f);
-            }
-        }
-    }
-    void* d_mask;
-    cudaMalloc(&d_mask, nc * hw * 2);
-    cudaMemcpy(d_mask, mask_h, nc * hw * 2, cudaMemcpyHostToDevice);
-    free(mask_h);
-    return d_mask;
-}
 
 /* ---- 2x spatial_prior: cat(y_hat_step, params) → engine → scales, means ---- */
 static DcvcRtStatus run_spatial_prior_2x(DcvcArCodec* c, void* d_yhat_step,
@@ -513,7 +486,6 @@ static DcvcRtStatus run_spatial_prior_2x(DcvcArCodec* c, void* d_yhat_step,
     const char* out_name = dcvc_trt_engine_tensor_name(c->eng_spatial_prior, nio - 1);
     dcvc_trt_engine_set_addr(c->eng_spatial_prior, out_name, ws->d_sp_out);
     DcvcRtStatus st = dcvc_trt_engine_execute(c->eng_spatial_prior, NULL);
-    cudaDeviceSynchronize();
     return st;
 }
 
@@ -546,14 +518,14 @@ static DcvcRtStatus dcvc_ar_codec_encode_2x(DcvcArCodec* c,
                         c->gcdf.dims[0], c->gcdf.dims[1], c->glen.i32, c->goff.i32);
 
     /* Round 0 */
-    void* d_mask0 = generate_mask_2x(0, nc, H, W);
+    void* d_mask0 = ws->d_masks[0];
     void *curr_scales = ws->d_scales, *curr_means = ws->d_means;
 
     /* y_q = process_mask_yq(y_scaled, scales, means, mask_0) */
     c->k_pmask_yq(ws->d_yq_full, curr_scales, curr_means, d_mask0,
-                  ws->d_yq_full, -1.0f, nc * hw, 0);
+                  ws->d_yq, -1.0f, nc * hw, 0);
     /* y_q_w = sp2x(y_q) */
-    c->k_sp2x(ws->d_yq_full, ws->d_yq_w, r * hw, 0);
+    c->k_sp2x(ws->d_yq, ws->d_yq_w, r * hw, 0);
     /* scales_r = sp2x(scales * mask_0) */
     c->k_mul(curr_scales, d_mask0, ws->d_smask, nc * hw, 0);
     c->k_sp2x(ws->d_smask, ws->d_sr, r * hw, 0);
@@ -562,15 +534,15 @@ static DcvcRtStatus dcvc_ar_codec_encode_2x(DcvcArCodec* c,
                        c->scale_min, c->scale_max,
                        c->log_scale_min, c->log_step_recip, r * hw, 0);
     {
-        int16_t* packed_h = (int16_t*)malloc(r * hw * 2);
-        cudaMemcpy(packed_h, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
-        dcvc_rans_encoder_encode_y(c->rans_enc, packed_h, r * hw, c->g_cdf_idx);
-        free(packed_h);
+        
+        cudaMemcpy(ws->h_packed, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
+        dcvc_rans_encoder_encode_y(c->rans_enc, (int16_t*)ws->h_packed, r * hw, c->g_cdf_idx);
+        
     }
     /* y_hat_0 = restore_y_2x(y_q_w, means, mask_0) */
     c->k_restore_y2x(ws->d_yq_w, curr_means, d_mask0, ws->d_yhat_step,
                      r * hw, nc * hw, 0);
-    cudaFree(d_mask0);
+    /* mask cached in ws */  ;
 
     /* spatial_prior: cat(y_hat_0, params) → scales_1, means_1 */
     st = run_spatial_prior_2x(c, ws->d_yhat_step, d_params, H, W);
@@ -579,25 +551,25 @@ static DcvcRtStatus dcvc_ar_codec_encode_2x(DcvcArCodec* c,
     curr_means = (void*)((char*)ws->d_sp_out + (size_t)nc * hw * 2);
 
     /* Round 1 */
-    void* d_mask1 = generate_mask_2x(1, nc, H, W);
+    void* d_mask1 = ws->d_masks[1];
     c->k_pmask_yq(ws->d_yq_full, curr_scales, curr_means, d_mask1,
-                  ws->d_yq_full, -1.0f, nc * hw, 0);
-    c->k_sp2x(ws->d_yq_full, ws->d_yq_w, r * hw, 0);
+                  ws->d_yq, -1.0f, nc * hw, 0);
+    c->k_sp2x(ws->d_yq, ws->d_yq_w, r * hw, 0);
     c->k_mul(curr_scales, d_mask1, ws->d_smask, nc * hw, 0);
     c->k_sp2x(ws->d_smask, ws->d_sr, r * hw, 0);
     c->k_build_idx_enc(ws->d_yq_w, ws->d_sr, (int16_t*)ws->d_packed,
                        c->scale_min, c->scale_max,
                        c->log_scale_min, c->log_step_recip, r * hw, 0);
     {
-        int16_t* packed_h = (int16_t*)malloc(r * hw * 2);
-        cudaMemcpy(packed_h, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
-        dcvc_rans_encoder_encode_y(c->rans_enc, packed_h, r * hw, c->g_cdf_idx);
-        free(packed_h);
+        
+        cudaMemcpy(ws->h_packed, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
+        dcvc_rans_encoder_encode_y(c->rans_enc, (int16_t*)ws->h_packed, r * hw, c->g_cdf_idx);
+        
     }
     /* y_hat_1 = restore_y_2x(y_q_w, means_1, mask_1) */
     c->k_restore_y2x(ws->d_yq_w, curr_means, d_mask1, ws->d_cat,
                      r * hw, nc * hw, 0);
-    cudaFree(d_mask1);
+    /* mask cached in ws */  ;
 
     /* y_hat = add_and_multiply(y_hat_0, y_hat_1, q_dec) = (y_hat_0 + y_hat_1) * q_dec */
     /* ws->d_yhat_step has y_hat_0, ws->d_cat has y_hat_1 */
@@ -636,7 +608,7 @@ static DcvcRtStatus dcvc_ar_codec_decode_2x(DcvcArCodec* c,
     dcvc_rans_decoder_set_stream(c->rans_dec, stream, stream_size);
 
     /* Round 0 */
-    void* d_mask0 = generate_mask_2x(0, nc, H, W);
+    void* d_mask0 = ws->d_masks[0];
     /* scales_r = sp2x(scales * mask_0) */
     c->k_mul(curr_scales, d_mask0, ws->d_smask, nc * hw, 0);
     c->k_sp2x(ws->d_smask, ws->d_sr, r * hw, 0);
@@ -661,7 +633,7 @@ static DcvcRtStatus dcvc_ar_codec_decode_2x(DcvcArCodec* c,
     /* y_hat_0 = restore_y_2x(y_q_r, means, mask_0) */
     c->k_restore_y2x(ws->d_yq_w, curr_means, d_mask0, ws->d_yhat_step,
                      r * hw, nc * hw, 0);
-    cudaFree(d_mask0);
+    /* mask cached in ws */  ;
 
     /* spatial_prior: cat(y_hat_0, params) → scales_1, means_1 */
     st = run_spatial_prior_2x(c, ws->d_yhat_step, d_params, H, W);
@@ -670,7 +642,7 @@ static DcvcRtStatus dcvc_ar_codec_decode_2x(DcvcArCodec* c,
     curr_means = (void*)((char*)ws->d_sp_out + (size_t)nc * hw * 2);
 
     /* Round 1 */
-    void* d_mask1 = generate_mask_2x(1, nc, H, W);
+    void* d_mask1 = ws->d_masks[1];
     c->k_mul(curr_scales, d_mask1, ws->d_smask, nc * hw, 0);
     c->k_sp2x(ws->d_smask, ws->d_sr, r * hw, 0);
     c->k_build_idx_dec(ws->d_sr, (uint8_t*)ws->d_indexes, c->scale_min, c->scale_max,
@@ -691,7 +663,7 @@ static DcvcRtStatus dcvc_ar_codec_decode_2x(DcvcArCodec* c,
     /* y_hat_1 = restore_y_2x(y_q_r, means_1, mask_1) */
     c->k_restore_y2x(ws->d_yq_w, curr_means, d_mask1, ws->d_cat,
                      r * hw, nc * hw, 0);
-    cudaFree(d_mask1);
+    /* mask cached in ws */  ;
 
     /* y_hat = (y_hat_0 + y_hat_1) * q_dec */
     c->k_add_mul(ws->d_yhat_step, ws->d_cat, ws->d_qdec, nc * hw, 0);
@@ -728,20 +700,11 @@ DcvcRtStatus dcvc_ar_codec_encode(DcvcArCodec* c,
     int32_t pf_dims[4] = {1, 514, H, W};
     st = bind_and_run(c->eng_reduction, "in0", pf_dims, (void*)d_params_fusion, ws->d_common);
     if (st != DCVC_RT_OK) return st;
-    cudaDeviceSynchronize();
 
     /* y_scaled = y * q_enc (broadcast q_enc across all channels) */
-    {
-        uint16_t* qe = (uint16_t*)malloc(hw * 2);
-        cudaMemcpy(qe, ws->d_qenc, hw * 2, cudaMemcpyDeviceToHost);
-        uint16_t* yh = (uint16_t*)malloc(nc * hw * 2);
-        cudaMemcpy(yh, d_y, nc * hw * 2, cudaMemcpyDeviceToHost);
-        for (int ch = 0; ch < nc; ch++)
-            for (int i = 0; i < hw; i++)
-                yh[ch * hw + i] = f32h(h2f(yh[ch * hw + i]) * h2f(qe[i]));
-        cudaMemcpy(ws->d_yq_full, yh, nc * hw * 2, cudaMemcpyHostToDevice);
-        free(qe); free(yh);
-    }
+    /* GPU: y_scaled = y * q_enc (broadcast, no host round-trip) */
+    c->k_broadcast_mul(d_y, ws->d_qenc,
+                       ws->d_yq_full, nc, hw, 0);
 
     /* rANS encoder: reset and add gaussian CDF */
     dcvc_rans_encoder_reset(c->rans_enc);
@@ -761,7 +724,7 @@ DcvcRtStatus dcvc_ar_codec_encode(DcvcArCodec* c,
         }
 
         /* Generate mask for this round */
-        void* d_mask = generate_mask(round, nc, H, W);
+        void* d_mask = ws->d_masks[round];
 
         /* scales_r = sp4x(scales * mask) */
         c->k_mul(curr_scales, d_mask, ws->d_smask, nc * hw, 0);
@@ -769,33 +732,33 @@ DcvcRtStatus dcvc_ar_codec_encode(DcvcArCodec* c,
 
         /* y_q = process_mask_yq(y_scaled, scales, means, mask) → full [nc, hw] */
         c->k_pmask_yq(ws->d_yq_full, curr_scales, curr_means, d_mask,
-                      ws->d_yq_full, -1.0f, nc * hw, 0);
+                      ws->d_yq, -1.0f, nc * hw, 0);
         /* y_q_w = sp4x(y_q) → [r, hw] */
-        c->k_sp4x(ws->d_yq_full, ws->d_yq_w, r * hw, 0);
+        c->k_sp4x(ws->d_yq, ws->d_yq_w, r * hw, 0);
 
         /* packed = build_index_enc(y_q_w, scales_r) */
         c->k_build_idx_enc(ws->d_yq_w, ws->d_sr, (int16_t*)ws->d_packed,
                            c->scale_min, c->scale_max,
                            c->log_scale_min, c->log_step_recip, r * hw, 0);
-        int16_t* packed_h = (int16_t*)malloc(r * hw * 2);
-        cudaMemcpy(packed_h, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
-        dcvc_rans_encoder_encode_y(c->rans_enc, packed_h, r * hw, c->g_cdf_idx);
-        free(packed_h);
+        
+        cudaMemcpy(ws->h_packed, ws->d_packed, r * hw * 2, cudaMemcpyDeviceToHost);
+        dcvc_rans_encoder_encode_y(c->rans_enc, (int16_t*)ws->h_packed, r * hw, c->g_cdf_idx);
+        
 
         /* restore_y_4x(y_q_w, means, mask) → y_hat_step ; accumulate */
         c->k_restore_y4x(ws->d_yq_w, curr_means, d_mask, ws->d_yhat_step,
                          r * hw, nc * hw, 0);
-        host_add_inplace(ws->d_yhat, ws->d_yhat_step, nc * hw);
+        c->k_add_inplace(ws->d_yhat, ws->d_yhat_step, nc * hw, 0);
 
-        cudaFree(d_mask);
+        /* mask cached in ws, no free */
     }
 
     /* y_hat_enc = y_hat_so_far * q_dec */
     {
-        uint16_t* qd = (uint16_t*)malloc(hw * 2);
-        cudaMemcpy(qd, ws->d_qdec, hw * 2, cudaMemcpyDeviceToHost);
-        host_mul_qdec(ws->d_yhat, qd, nc, hw);
-        free(qd);
+
+
+        c->k_broadcast_mul(ws->d_yhat, ws->d_qdec, ws->d_yhat, nc, hw, 0);
+
     }
     if (d_y_hat_out)
         cudaMemcpy(d_y_hat_out, ws->d_yhat, (size_t)nc * hw * 2, cudaMemcpyDeviceToDevice);
@@ -832,7 +795,6 @@ DcvcRtStatus dcvc_ar_codec_decode(DcvcArCodec* c,
     int32_t pf_dims[4] = {1, 514, H, W};
     st = bind_and_run(c->eng_reduction, "in0", pf_dims, (void*)d_params_fusion, ws->d_common);
     if (st != DCVC_RT_OK) return st;
-    cudaDeviceSynchronize();
 
     /* rANS decoder setup */
     dcvc_rans_decoder_reset_cdf(c->rans_dec);
@@ -852,7 +814,7 @@ DcvcRtStatus dcvc_ar_codec_decode(DcvcArCodec* c,
             curr_means = (void*)((char*)ws->d_cat + (size_t)nc * hw * 2);
         }
 
-        void* d_mask = generate_mask(round, nc, H, W);
+        void* d_mask = ws->d_masks[round];
 
         /* scales_r = sp4x(scales * mask) */
         c->k_mul(curr_scales, d_mask, ws->d_smask, nc * hw, 0);
@@ -879,17 +841,17 @@ DcvcRtStatus dcvc_ar_codec_decode(DcvcArCodec* c,
         /* restore_y_4x and accumulate */
         c->k_restore_y4x(ws->d_yq_w, curr_means, d_mask, ws->d_yhat_step,
                          r * hw, nc * hw, 0);
-        host_add_inplace(ws->d_yhat, ws->d_yhat_step, nc * hw);
+        c->k_add_inplace(ws->d_yhat, ws->d_yhat_step, nc * hw, 0);
 
-        cudaFree(d_mask);
+        /* mask cached in ws, no free */
     }
 
     /* y_hat = y_hat_so_far * q_dec */
     {
-        uint16_t* qd = (uint16_t*)malloc(hw * 2);
-        cudaMemcpy(qd, ws->d_qdec, hw * 2, cudaMemcpyDeviceToHost);
-        host_mul_qdec(ws->d_yhat, qd, nc, hw);
-        free(qd);
+
+
+        c->k_broadcast_mul(ws->d_yhat, ws->d_qdec, ws->d_yhat, nc, hw, 0);
+
     }
 
     /* Copy result to caller's buffer */
