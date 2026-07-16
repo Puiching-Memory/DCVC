@@ -40,7 +40,7 @@ def export_from_ckpt(image_ckpt: Path, video_ckpt: Path, out: Path) -> None:
         net = DMCI()
         net.load_state_dict(get_state_dict(str(image_ckpt)), strict=False)
         net.eval()
-        net.update(force=True)
+        net.update()
         if hasattr(net, "q_scale_enc"):
             p = out / "qp" / "intra_q_scale_enc.bin"
             write_qp_bank(p, net.q_scale_enc)
@@ -64,7 +64,7 @@ def export_from_ckpt(image_ckpt: Path, video_ckpt: Path, out: Path) -> None:
         net = DMC()
         net.load_state_dict(get_state_dict(str(video_ckpt)), strict=False)
         net.eval()
-        net.update(force=True)
+        net.update()
         for attr in ("q_encoder", "q_decoder", "q_feature", "q_recon"):
             if hasattr(net, attr):
                 p = out / "qp" / f"inter_{attr}.bin"

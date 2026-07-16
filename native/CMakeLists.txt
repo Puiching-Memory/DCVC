@@ -29,47 +29,45 @@ else()
   target_compile_options(dcvc_rans PRIVATE -Wall -Wextra)
 endif()
 
-# --- plugins (CPU reference + optional TRT) ---
+# --- plugins (CPU reference only; TRT plugins are compiled standalone) ---
 set(DCVC_PLUGIN_SOURCES
   plugins/src/plugins_cpu.c
   plugins/src/ar_prior.c
 )
-if(DCVC_RT_HAS_TENSORRT)
-  list(APPEND DCVC_PLUGIN_SOURCES plugins/src/depthconv_plugin.cpp plugins/src/mask_plugin.cpp)
-endif()
-
 add_library(dcvc_plugins STATIC ${DCVC_PLUGIN_SOURCES})
 target_include_directories(dcvc_plugins PUBLIC ${DCVC_RT_INCLUDE})
 target_link_libraries(dcvc_plugins PUBLIC dcvc_rans)
 
 # --- core runtime ---
-add_library(dcvc_rt STATIC
+set(DCVC_RT_SOURCES
   src/bitstream.c
   src/color.c
   src/dpb.c
   src/trt_runner.c
   src/dcvc_rt.c
 )
+if(DCVC_RT_HAS_TENSORRT)
+  list(APPEND DCVC_RT_SOURCES src/trt_engine.cpp src/dcvc_ar_codec.c)
+  list(APPEND DCVC_RT_SOURCES src/dcvc_intra_pipeline.c)
+endif()
+
+add_library(dcvc_rt STATIC ${DCVC_RT_SOURCES})
 target_include_directories(dcvc_rt PUBLIC ${DCVC_RT_INCLUDE})
 target_link_libraries(dcvc_rt PUBLIC dcvc_rans dcvc_plugins)
 
 if(DCVC_RT_HAS_TENSORRT)
   target_compile_definitions(dcvc_rt PUBLIC DCVC_RT_HAS_TENSORRT)
-  target_compile_definitions(dcvc_plugins PUBLIC DCVC_RT_HAS_TENSORRT)
-  # User must set TensorRT_ROOT
-  if(DEFINED TensorRT_ROOT)
-    target_include_directories(dcvc_rt PUBLIC ${TensorRT_ROOT}/include)
-    target_include_directories(dcvc_plugins PUBLIC ${TensorRT_ROOT}/include)
-    target_link_directories(dcvc_rt PUBLIC ${TensorRT_ROOT}/lib)
-    target_link_libraries(dcvc_rt PUBLIC nvinfer)
-  endif()
+  target_include_directories(dcvc_rt PUBLIC
+    /usr/include/x86_64-linux-gnu
+    /usr/local/cuda-13.2/include)
+  target_link_directories(dcvc_rt PUBLIC /usr/local/cuda-13.2/lib64 /usr/lib/x86_64-linux-gnu)
+  target_link_libraries(dcvc_rt PUBLIC nvinfer cudart ${CMAKE_DL_LIBS})
 endif()
 
 if(DCVC_RT_HAS_CUDA)
   enable_language(CUDA)
   target_compile_definitions(dcvc_plugins PUBLIC DCVC_RT_HAS_CUDA)
   target_compile_definitions(dcvc_rt PUBLIC DCVC_RT_HAS_CUDA)
-  target_sources(dcvc_plugins PRIVATE plugins/src/cuda_kernels.cu)
 endif()
 
 # Threads for rANS multi-thread
@@ -100,3 +98,66 @@ endif()
 
 install(TARGETS dcvc_rt dcvc_rans dcvc_plugins ARCHIVE DESTINATION lib)
 install(FILES include/dcvc_rt.h DESTINATION include)
+
+# TRT engine integration test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_trt_engine tests/test_trt_engine.c)
+  target_link_libraries(test_trt_engine PRIVATE dcvc_rt)
+  # test_trt_engine requires CLI args (engine_id input.npy ref.npy); run manually
+endif()
+
+# C I-frame decode test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_c_iframe_decode tests/test_c_iframe_decode.c)
+  target_link_libraries(test_c_iframe_decode PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  # test_c_iframe_decode requires CLI args (golden_dir engine_dir plugin_dir cdf_dir); run manually
+endif()
+
+# Full C decode pipeline test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_c_decode_full tests/test_c_decode_full.c)
+  target_link_libraries(test_c_decode_full PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME c_decode_full COMMAND test_c_decode_full WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# rANS z decode test
+if(DCVC_RT_BUILD_TESTS)
+  add_executable(test_rans_z_decode tests/test_rans_z_decode.c)
+  target_link_libraries(test_rans_z_decode PRIVATE dcvc_rans)
+  add_test(NAME rans_z_decode COMMAND test_rans_z_decode WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# 4x y decode test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_y_decode_4x tests/test_y_decode_4x.c)
+  target_link_libraries(test_y_decode_4x PRIVATE dcvc_rt dcvc_rans ${CMAKE_DL_LIBS})
+  add_test(NAME y_decode_4x COMMAND test_y_decode_4x WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# Closed-loop self-consistency test (encode + decode, same TRT engines)
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_closed_loop tests/test_closed_loop.c)
+  target_link_libraries(test_closed_loop PRIVATE dcvc_rt dcvc_rans ${CMAKE_DL_LIBS})
+  add_test(NAME closed_loop COMMAND test_closed_loop WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# AR codec production module integration test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_ar_codec tests/test_ar_codec.c)
+  target_link_libraries(test_ar_codec PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME ar_codec COMMAND test_ar_codec WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# Full intra-frame pipeline end-to-end test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_intra_pipeline tests/test_intra_pipeline.c)
+  target_link_libraries(test_intra_pipeline PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME intra_pipeline COMMAND test_intra_pipeline WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# 4x pipeline test (golden symbols)
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_4x_pipeline tests/test_4x_pipeline.c)
+  target_link_libraries(test_4x_pipeline PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME 4x_pipeline COMMAND test_4x_pipeline WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()

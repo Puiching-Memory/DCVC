@@ -19,7 +19,8 @@ typedef enum DcvcEngineId {
     DCVC_ENG_INTER_PRIOR_FUSION = 8,
     DCVC_ENG_INTER_SPATIAL_PRIOR = 9,
     DCVC_ENG_INTER_SYNTHESIS = 10,
-    DCVC_ENG_COUNT = 11
+    DCVC_ENG_HYPER_DEC = 11,
+    DCVC_ENG_COUNT = 12
 } DcvcEngineId;
 
 typedef struct DcvcTensorView {
@@ -46,6 +47,11 @@ DcvcRtStatus dcvc_trt_runner_execute(DcvcTrtRunner* r, DcvcEngineId id,
 /* QP bank gather: copy q_[qp] into out host FP16 tensor [1,C,1,1] from asset blob. */
 DcvcRtStatus dcvc_trt_load_qp_scale(DcvcTrtRunner* r, const char* bank_name, int qp,
                                     uint16_t* out_fp16, int channels);
+
+/* Get (lazy-load) a raw engine handle for direct binding. */
+struct DcvcTrtEngine;
+struct DcvcTrtEngine* dcvc_trt_runner_get_engine(DcvcTrtRunner* r, DcvcEngineId id,
+                                                  DcvcRtStatus* st);
 
 #ifdef __cplusplus
 }

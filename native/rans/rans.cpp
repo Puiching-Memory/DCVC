@@ -218,8 +218,11 @@ void RansEncoderLib::flush()
         return;
     }
 
-    uint8_t* output = new uint8_t[total_symbol_size];  // too much space ?
-    uint8_t* ptrEnd = output + total_symbol_size;
+    /* Allocate generously: in-range symbols compress to < 1 byte each, but
+       out-of-range (escape) symbols need several bytes of bypass coding.
+       5x + slack covers the worst case where every symbol is an escape. */
+    uint8_t* output = new uint8_t[total_symbol_size * 5 + 1024];
+    uint8_t* ptrEnd = output + total_symbol_size * 5 + 1024;
     uint8_t* ptr = ptrEnd;
     assert(ptr != nullptr);
 
