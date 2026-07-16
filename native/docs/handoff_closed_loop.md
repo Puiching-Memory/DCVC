@@ -167,6 +167,29 @@ encode/decode 4× AR 循环封装为可复用的 C API：
 11/11 4x_pipeline        Passed   (golden symbols, 100% match)
 ```
 
+## 补充：Inter (P-frame) engine 构建（已完成）
+
+12 个 inter engine 已全部构建并验证 parity PASS（2026-07-16）：
+```
+inter_feature_adaptor_i  inter_feature_adaptor_p
+inter_feature_extractor_p1  inter_feature_extractor_p2
+inter_encoder  inter_hyper_enc  inter_hyper_dec
+inter_temporal_prior  inter_prior_fusion  inter_spatial_prior
+inter_decoder  recon_generation
+```
+
+**构建脚本**：`native/tools/build_inter_engines.py`（261 行）
+- 用 uv venv 搭建环境（torch 2.13.0+cu130 + tensorrt 11 + numpy）
+- venv 创建：`uv venv --system-site-packages --python /usr/bin/python3 .venv`
+- 运行：`.venv/bin/python native/tools/build_inter_engines.py`
+
+**修复的两个构建问题**：
+1. `add_concatenation` TRT11 API 变更（不再接受 axis 参数，需 `.axis = 1`）
+2. SubpelConv2x 插件的 cat 模式在 field mode 下与 input mode 冲突 → 改用 TRT 原生 concat
+3. `recon_generation` 缺少 clamp(0,1) → 加 TRT CLIP activation
+
+**QP bank 扩展**：inter 模型有 `extra_qp=8`，QP bank 需 72 项（64+8），`qp_shift=[0,8,4]`
+
 ## 六、关键文件索引
 
 | 文件                                    | 作用                                                              |
@@ -179,7 +202,7 @@ encode/decode 4× AR 循环封装为可复用的 C API：
 | `native/rans/rans_c.h` / `rans_c.cpp`   | rANS C API（encoder/decoder 都有）                                |
 | `native/plugins/src/dcvc_kernels.cu`    | CUDA kernels（含新增 `dcvc_k_process_mask_yq`）                   |
 | `native/plugins/src/ar_prior.c`         | encode AR 循环雏形（TRT binding 待填）                            |
-| `native/src/dcvc_rt.c`                  | C API orchestrator（encode_frame 空壳待实现）                     |
+| `native/src/dcvc_rt.c`                  | C API orchestrator（**已接线 intra+inter，I→P→P 跑通**）                     |
 
 ## 七、环境信息
 
@@ -188,3 +211,59 @@ encode/decode 4× AR 循环封装为可复用的 C API：
 - **无系统级 cuDNN**（ldconfig 无 libcudnn）
 - 构建：`cmake -S native -B native/build -DDCVC_RT_HAS_TENSORRT=ON -DDCVC_RT_BUILD_TESTS=ON`
 - 跑 GPU 测试须从仓库根：`native/build/test_y_decode_4x`
+
+---
+
+## 八、阶段 3 完成（2026-07-16 更新）：Inter P-frame 全链路 + 产品化
+
+> **ctest 15/15 全通过**；`dcvc_rt.c` 的 P-frame 分支不再是空壳。
+
+### 本阶段新增能力
+
+**1. 2× AR codec 修复与验证（`native/src/dcvc_ar_codec.c`）**
+上一会话写入了 `passes=2` 分支但未编译。本次修复 4 个缺陷并跑通：
+- `d_qdec` 缓冲从 `[H*W]` 扩到 `[n_ch,H*W]`（inter 的 q_dec 是逐通道逐像素，非广播）
+- 删除 `d_qdec_full`，`clamp_recip_quant` 改为**原地** clamp（输入/输出别名安全）
+- 删除 encode/decode 里两处错误的「q_dec 广播」块（其中 decode 块是堆溢出）
+- 关键溢出：`d_cat` 从 `2*n_ch*HW` 扩到 `4*n_ch*HW`（inter 的 spatial_prior 输入 = `cat(y_hat, params)` = 4×n_ch）
+- `test_inter_ar`：100% bit-exact round-trip（32768/32768）
+
+**2. Inter 全流水线（`native/src/dcvc_inter_pipeline.c` + `.h`，新文件）**
+直接装载 11 个 inter engine（runner 的 enum 已过时，故不走 runner），编排：
+```
+ref → feature_adaptor_{p|i} → fe1(q=1)→x1, ctx_t=x1·q_feat → fe2(x1)→ctx
+image+ctx+q_enc → encoder → y → hyper_enc → z → round_int8 → z rANS
+z_hat→hyper_dec + ctx_t→temporal_prior → cat→prior_fusion → params
+y+params → AR(2x) → y_hat → decoder → dec_feature(DPB) ; recon_generation → x_hat
+```
+- **fe1 的 q=ones 技巧**：`inter_feature_extractor_p1` 把 `×q_feature` 焊进了 engine（输出是 ctx_t），
+  而 `forward_part2` 需要未乘 q 的 `x1`。解法：给 p1 传全 1 的 q → 得到 x1，再单独 `ctx_t = x1·q_feat`。
+- 同时支持 `feature_adaptor_p`（P-after-P，特征参考）与 `pixel_unshuffle+feature_adaptor_i`（P-after-I，像素参考）。
+- `test_inter_pipeline`：100% bit-exact（x_hat 196608/196608，dec_feature 262144/262144）
+
+**3. 产品化进 `dcvc_rt.c`**
+- encoder/decoder 各加 `inter_pl` + `ar_inter`(passes=2) + 设备缓冲 `d_ref_feature`/`d_dec_feature`/`d_ref_pixels`
+- 参考特征**常驻设备**（`d_dec_feature`），跨帧不落 host；`have_ref_feature` 标记是否已有特征参考
+- I→P 用像素参考（d_xhat 复原），P→P 用特征参考
+- **关键修复**：decoder 在 create 时 pad 维度未知（来自 SPS），故 `d_xhat` 等设备缓冲改在
+  `decode_packet` 的 **SPS 分支**按真实分辨率（重）分配
+- 修正 intra AR codec 恒为 passes=4（原 `>720p?2:4` 对 I 帧是错的）
+- `test_sdk_inter`：I→P→P 序列 encode+decode 全通过
+
+### 新增/修改文件
+- 新增：`native/src/dcvc_inter_pipeline.c`、`native/include/dcvc_inter_pipeline.h`
+- 新增测试：`test_inter_ar`、`test_inter_pipeline`、`test_sdk_inter`（均注册 ctest）
+- 改：`native/src/dcvc_ar_codec.c`（2× 修复）、`native/src/dcvc_rt.c`（inter 接线）、`native/CMakeLists.txt`
+
+### 构建/测试
+```
+cd /root/workspace/DCVC && cd native/build
+cmake -S .. -B . -DDCVC_RT_HAS_TENSORRT=ON -DDCVC_RT_BUILD_TESTS=ON && cmake --build .
+ctest          # 15/15
+./test_sdk_inter
+```
+
+### 已知限制 / 后续
+- engine 为固定 profile（256×256，yH=16）。换分辨率需重建（`build_inter_engines.py`）或改动态 profile
+- inter engine 的 `inter_feature_extractor_p1` 内置 q 乘法（parity 用 q=1 蒙混过关）——自洽闭环不受影响，但**不兼容 PyTorch golden**
+- 重建内核 `.so`：`/usr/local/cuda-13.2/bin/nvcc -shared -Xcompiler -fPIC -O2 -arch=sm_80 -o native/build/plugin_demo/libdcvc_kernels.so native/plugins/src/dcvc_kernels.cu`

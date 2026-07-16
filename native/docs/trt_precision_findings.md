@@ -11,11 +11,11 @@ C 全流程 decode (`test_y_decode_4x`) 中 Round 0 符号匹配 100%，但 Roun
 
 **cuBLAS GEMM（TRT 插件）与 cuDNN conv2d（PyTorch golden）在 FP16 下产生不同结果。**
 
-| 组件 | 计算路径 | 单层 max_abs |
-|------|---------|-------------|
-| PyTorch golden | `F::conv2d` → cuDNN | 基准 |
-| TRT DepthConv 插件 | `cublasGemmEx` (computeType=FP32) | ~0.015–0.031 |
-| TRT 原生 conv2d 层 | TRT 内部实现 | ~0.25（更差） |
+| 组件               | 计算路径                          | 单层 max_abs  |
+| ------------------ | --------------------------------- | ------------- |
+| PyTorch golden     | `F::conv2d` → cuDNN               | 基准          |
+| TRT DepthConv 插件 | `cublasGemmEx` (computeType=FP32) | ~0.015–0.031  |
+| TRT 原生 conv2d 层 | TRT 内部实现                      | ~0.25（更差） |
 
 误差来源是**算法层面**的，不是 rounding 策略问题：
 - cuDNN 对 1×1 FP16 conv 使用专门的 fused kernel（与 bias 合并、单次 rounding）
@@ -35,12 +35,12 @@ adaptor_1 (1个 DepthConvBlock):     max_abs=0.031
 
 每一轮的空间先验（adaptor + y_spatial_prior）都依赖上一轮的 y_hat_so_far，因此误差**指数级放大**：
 
-| 轮次 | scales max_abs (vs golden) | 符号匹配率 | 原因 |
-|------|---------------------------|-----------|------|
-| Round 0 | 0.000 | **100%** | scales 来自 params_fusion（无 TRT spatial prior） |
-| Round 1 | 0.039 | 20.3% | adaptor_1 + y_spatial_prior 的 cuBLAS 误差 |
-| Round 2 | 2.684 | 20.2% | Round 1 误差经 rANS 级联放大 |
-| Round 3 | 4.736 | 20.4% | 进一步放大 |
+| 轮次    | scales max_abs (vs golden) | 符号匹配率 | 原因                                              |
+| ------- | -------------------------- | ---------- | ------------------------------------------------- |
+| Round 0 | 0.000                      | **100%**   | scales 来自 params_fusion（无 TRT spatial prior） |
+| Round 1 | 0.039                      | 20.3%      | adaptor_1 + y_spatial_prior 的 cuBLAS 误差        |
+| Round 2 | 2.684                      | 20.2%      | Round 1 误差经 rANS 级联放大                      |
+| Round 3 | 4.736                      | 20.4%      | 进一步放大                                        |
 
 ## 已排除的原因
 

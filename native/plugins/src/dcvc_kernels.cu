@@ -344,6 +344,22 @@ extern "C" void dcvc_k_single_part_writing_4x(const __half* x, __half* out,
 }
 
 // ===========================================================================
+// 12b. single_part_for_writing_2x:  out[i] = x[i] + x[i+N]  (half-channel sum)
+// ===========================================================================
+__global__ void single_part_writing_2x_k(const __half* x, __half* out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float s = __half2float(x[i]) + __half2float(x[i + N]);
+    out[i] = __float2half_rn(s);
+}
+
+extern "C" void dcvc_k_single_part_writing_2x(const __half* x, __half* out,
+                                              int N, cudaStream_t stream) {
+    int g, b; launch_config(N, g, b);
+    single_part_writing_2x_k<<<g, b, 0, stream>>>(x, out, N);
+}
+
+// ===========================================================================
 // 13. elementwise multiply
 // ===========================================================================
 __global__ void elem_mul_k(const __half* a, const __half* b, __half* out, int N) {

@@ -49,6 +49,7 @@ set(DCVC_RT_SOURCES
 if(DCVC_RT_HAS_TENSORRT)
   list(APPEND DCVC_RT_SOURCES src/trt_engine.cpp src/dcvc_ar_codec.c)
   list(APPEND DCVC_RT_SOURCES src/dcvc_intra_pipeline.c)
+  list(APPEND DCVC_RT_SOURCES src/dcvc_inter_pipeline.c)
 endif()
 
 add_library(dcvc_rt STATIC ${DCVC_RT_SOURCES})
@@ -148,6 +149,26 @@ if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
   add_test(NAME ar_codec COMMAND test_ar_codec WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 endif()
 
+# SDK-level I→P→P integration test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_sdk_inter tests/test_sdk_inter.c)
+  target_link_libraries(test_sdk_inter PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME sdk_inter COMMAND test_sdk_inter WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+# 2x (inter/P-frame) AR codec round-trip test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_inter_ar tests/test_inter_ar.c)
+  target_link_libraries(test_inter_ar PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME inter_ar COMMAND test_inter_ar WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# Full inter (P-frame) pipeline end-to-end closed-loop test
+if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
+  add_executable(test_inter_pipeline tests/test_inter_pipeline.c)
+  target_link_libraries(test_inter_pipeline PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME inter_pipeline COMMAND test_inter_pipeline WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
 # Full intra-frame pipeline end-to-end test
 if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
   add_executable(test_intra_pipeline tests/test_intra_pipeline.c)
@@ -160,4 +181,11 @@ if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
   add_executable(test_4x_pipeline tests/test_4x_pipeline.c)
   target_link_libraries(test_4x_pipeline PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
   add_test(NAME 4x_pipeline COMMAND test_4x_pipeline WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# 2x AR kernel parity test (inter/P-frame kernels)
+if(DCVC_RT_BUILD_TESTS)
+  add_executable(test_kernels_2x tests/test_kernels_2x.c)
+  target_link_libraries(test_kernels_2x PRIVATE dcvc_rt ${CMAKE_DL_LIBS})
+  add_test(NAME kernels_2x COMMAND test_kernels_2x WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 endif()

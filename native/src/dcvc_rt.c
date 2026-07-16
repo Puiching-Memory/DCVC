@@ -7,6 +7,7 @@
 #include "rans_c.h"
 #include "dcvc_ar_codec.h"
 #include "dcvc_intra_pipeline.h"
+#include "dcvc_inter_pipeline.h"
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -74,8 +75,14 @@ struct DcvcRtEncoder {
     DcvcDpb dpb;
     DcvcTrtRunner* trt;
     DcvcRansEncoder* rans;
-    DcvcArCodec* ar_codec;  /* production AR spatial-prior codec */
+    DcvcArCodec* ar_codec;  /* intra AR codec (256ch / 4-pass) */
+    DcvcArCodec* ar_inter; /* inter AR codec (128ch / 2-pass) */
+    DcvcInterPipeline* inter_pl;
     void* d_image;         /* device FP16 [1,3,padH,padW] */
+    void* d_ref_feature;   /* device FP16 [1,256,padH/8,padW/8] ref feature */
+    void* d_dec_feature;   /* device FP16 [1,256,padH/8,padW/8] decoder feature */
+    void* d_ref_pixels;    /* device FP16 [1,3,padH,padW] ref pixels (P-after-I) */
+    int have_ref_feature;  /* 1 once a decoder feature is available as next ref */
     void* d_xhat;          /* device FP16 [1,3,padH,padW] reconstruction */
     float* ycbcr_f32;
     uint16_t* ycbcr_f16;
@@ -90,8 +97,14 @@ struct DcvcRtDecoder {
     DcvcDpb dpb;
     DcvcTrtRunner* trt;
     DcvcRansDecoder* rans;
-    DcvcArCodec* ar_codec;  /* production AR spatial-prior codec */
+    DcvcArCodec* ar_codec;  /* intra AR codec (256ch / 4-pass) */
+    DcvcArCodec* ar_inter; /* inter AR codec (128ch / 2-pass) */
+    DcvcInterPipeline* inter_pl;
     void* d_xhat;          /* device FP16 [1,3,padH,padW] reconstruction */
+    void* d_ref_feature;   /* device FP16 [1,256,padH/8,padW/8] ref feature */
+    void* d_dec_feature;   /* device FP16 [1,256,padH/8,padW/8] decoder feature */
+    void* d_ref_pixels;    /* device FP16 [1,3,padH,padW] ref pixels (P-after-I) */
+    int have_ref_feature;  /* 1 once a decoder feature is available as next ref */
     float* ycbcr_f32;
     uint16_t* ycbcr_f16;
 };
@@ -194,9 +207,25 @@ DcvcRtEncoder* dcvc_rt_encoder_create(const DcvcRtConfig* cfg, DcvcRtStatus* out
         char plugin_dir[640];
         const char* ad = cfg->asset_dir ? cfg->asset_dir : "native/assets";
         snprintf(plugin_dir, sizeof(plugin_dir), "%s/../build/plugin_demo", ad);
-        int passes = (cfg->width * cfg->height > 1280 * 720) ? 2 : 4;
+        int passes = 4;  /* intra I-frame AR: always 256ch / 4-pass */
         enc->ar_codec = dcvc_ar_codec_create(ad, plugin_dir, passes, &st);
         /* Non-fatal: codec is optional, encode_frame works without it */
+    }
+
+    /* Inter (P-frame) pipeline + AR codec; non-fatal if engines absent */
+    {
+        const char* ad2 = cfg->asset_dir ? cfg->asset_dir : "native/assets";
+        char plugin_dir2[640];
+        snprintf(plugin_dir2, sizeof(plugin_dir2), "%s/../build/plugin_demo", ad2);
+        enc->inter_pl = dcvc_inter_pipeline_create(ad2, plugin_dir2, &st);
+        enc->ar_inter = dcvc_ar_codec_create(ad2, plugin_dir2, 2, &st);
+    }
+    {
+        size_t fn = (size_t)256 * (enc->pad_h / 8) * (enc->pad_w / 8) * 2;
+        size_t pn = (size_t)3 * enc->pad_h * enc->pad_w * 2;
+        cudaMalloc(&enc->d_ref_feature, fn);
+        cudaMalloc(&enc->d_dec_feature, fn);
+        cudaMalloc(&enc->d_ref_pixels, pn);
     }
 
     if (out_st) *out_st = DCVC_RT_OK;
@@ -210,8 +239,13 @@ void dcvc_rt_encoder_destroy(DcvcRtEncoder* enc)
     dcvc_trt_runner_destroy(enc->trt);
     dcvc_rans_encoder_destroy(enc->rans);
     dcvc_ar_codec_destroy(enc->ar_codec);
+    dcvc_ar_codec_destroy(enc->ar_inter);
+    dcvc_inter_pipeline_destroy(enc->inter_pl);
     cudaFree(enc->d_image);
     cudaFree(enc->d_xhat);
+    cudaFree(enc->d_ref_feature);
+    cudaFree(enc->d_dec_feature);
+    cudaFree(enc->d_ref_pixels);
     free(enc->ycbcr_f32);
     free(enc->ycbcr_f16);
     free(enc);
@@ -267,6 +301,21 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
             dcvc_bw_free(&bw);
             return est;
         }
+        enc->have_ref_feature = 0;  /* after I-frame, next P references recon pixels */
+    } else if (enc->inter_pl && enc->ar_inter) {
+        /* Full inter P-frame pipeline */
+        size_t img_bytes = (size_t)3 * enc->pad_h * enc->pad_w * 2;
+        cudaMemcpy(enc->d_image, enc->ycbcr_f16, img_bytes, cudaMemcpyHostToDevice);
+        const void* d_ref_feat = enc->have_ref_feature ? enc->d_dec_feature : NULL;
+        const void* d_ref_pix = enc->have_ref_feature ? NULL : enc->d_xhat; /* I recon */
+        DcvcRtStatus est = dcvc_inter_encode(enc->inter_pl, enc->ar_inter, enc->rans,
+            enc->d_image, d_ref_feat, d_ref_pix, enc->pad_h, enc->pad_w, enc->cfg.qp,
+            &payload, &payload_len, enc->d_xhat, enc->d_dec_feature);
+        if (est != DCVC_RT_OK) {
+            dcvc_bw_free(&bw);
+            return est;
+        }
+        enc->have_ref_feature = 1;
     } else if (have_nn) {
         /* Inter frame or no AR codec: fall back to placeholder payload */
         DcvcRtStatus est = dcvc_trt_runner_execute(enc->trt, analysis, NULL, 0, NULL, 0, NULL);
@@ -345,15 +394,20 @@ DcvcRtDecoder* dcvc_rt_decoder_create(const DcvcRtConfig* cfg, DcvcRtStatus* out
         char plugin_dir[640];
         const char* ad = dec->cfg.asset_dir ? dec->cfg.asset_dir : "native/assets";
         snprintf(plugin_dir, sizeof(plugin_dir), "%s/../build/plugin_demo", ad);
-        int passes = (dec->cfg.width * dec->cfg.height > 1280 * 720) ? 2 : 4;
+        int passes = 4;  /* intra I-frame AR: always 256ch / 4-pass */
         dec->ar_codec = dcvc_ar_codec_create(ad, plugin_dir, passes, &st);
     }
 
-    /* Device buffer for reconstruction */
+    /* Inter (P-frame) pipeline + AR codec; non-fatal if engines absent */
     {
-        size_t dn = (size_t)3 * dec->pad_h * dec->pad_w * 2;
-        cudaMalloc(&dec->d_xhat, dn);
+        const char* ad2 = dec->cfg.asset_dir ? dec->cfg.asset_dir : "native/assets";
+        char plugin_dir2[640];
+        snprintf(plugin_dir2, sizeof(plugin_dir2), "%s/../build/plugin_demo", ad2);
+        dec->inter_pl = dcvc_inter_pipeline_create(ad2, plugin_dir2, &st);
+        dec->ar_inter = dcvc_ar_codec_create(ad2, plugin_dir2, 2, &st);
     }
+
+    /* Device buffers (dimensions finalized at first SPS; allocate zero-size now) */
     if (out_st) *out_st = DCVC_RT_OK;
     return dec;
 }
@@ -365,7 +419,12 @@ void dcvc_rt_decoder_destroy(DcvcRtDecoder* dec)
     dcvc_trt_runner_destroy(dec->trt);
     dcvc_rans_decoder_destroy(dec->rans);
     dcvc_ar_codec_destroy(dec->ar_codec);
+    dcvc_ar_codec_destroy(dec->ar_inter);
+    dcvc_inter_pipeline_destroy(dec->inter_pl);
     cudaFree(dec->d_xhat);
+    cudaFree(dec->d_ref_feature);
+    cudaFree(dec->d_dec_feature);
+    cudaFree(dec->d_ref_pixels);
     free(dec->ycbcr_f32);
     free(dec->ycbcr_f16);
     free(dec);
@@ -399,6 +458,20 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
             size_t n = (size_t)3 * dec->pad_h * dec->pad_w;
             dec->ycbcr_f32 = (float*)calloc(n, sizeof(float));
             dec->ycbcr_f16 = (uint16_t*)calloc(n, sizeof(uint16_t));
+            /* (Re)allocate device buffers now that dimensions are known */
+            {
+                size_t dn = (size_t)3 * dec->pad_h * dec->pad_w * 2;
+                size_t fn = (size_t)256 * (dec->pad_h / 8) * (dec->pad_w / 8) * 2;
+                cudaFree(dec->d_xhat);       dec->d_xhat = NULL;
+                cudaFree(dec->d_ref_feature);dec->d_ref_feature = NULL;
+                cudaFree(dec->d_dec_feature);dec->d_dec_feature = NULL;
+                cudaFree(dec->d_ref_pixels); dec->d_ref_pixels = NULL;
+                cudaMalloc(&dec->d_xhat, dn);
+                cudaMalloc(&dec->d_ref_feature, fn);
+                cudaMalloc(&dec->d_dec_feature, fn);
+                cudaMalloc(&dec->d_ref_pixels, dn);
+                dec->have_ref_feature = 0;
+            }
             dcvc_rans_decoder_set_two(dec->rans, dec->sps.ec_part);
             continue;
         }
@@ -421,6 +494,32 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
                                                      qp, dec->d_xhat);
                 free(payload);
                 if (est != DCVC_RT_OK) return est;
+                /* Copy x_hat from device to host f32 */
+                size_t dn = (size_t)3 * dec->pad_h * dec->pad_w;
+                uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
+                cudaMemcpy(xh16, dec->d_xhat, dn * 2, cudaMemcpyDeviceToHost);
+                for (size_t i = 0; i < dn; i++) {
+                    uint16_t h = xh16[i];
+                    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
+                    if (e == 0) { if (m == 0) f = s << 31; else { int ex = -1; while (!(m & 0x400)) { m <<= 1; ex--; } m &= 0x3ff; e = 127 + ex - 14; f = (s << 31) | (e << 23) | (m << 13); } }
+                    else if (e == 31) { f = (s << 31) | (0xff << 23) | (m << 13); }
+                    else { f = (s << 31) | ((e + 127 - 15) << 23) | (m << 13); }
+                    float v; memcpy(&v, &f, 4);
+                    if (v < 0) v = 0; if (v > 1) v = 1;
+                    dec->ycbcr_f32[i] = v;
+                }
+                free(xh16);
+                dec->have_ref_feature = 0;  /* after I-frame, next P references recon pixels */
+            } else if (dec->inter_pl && dec->ar_inter && plen > 0 && nal == DCVC_NAL_P) {
+                /* Full inter P-frame pipeline decode */
+                const void* d_ref_feat = dec->have_ref_feature ? dec->d_dec_feature : NULL;
+                const void* d_ref_pix = dec->have_ref_feature ? NULL : dec->d_xhat;
+                DcvcRtStatus est = dcvc_inter_decode(dec->inter_pl, dec->ar_inter, dec->rans,
+                    payload, plen, d_ref_feat, d_ref_pix, dec->pad_h, dec->pad_w, qp,
+                    dec->d_xhat, dec->d_dec_feature);
+                free(payload);
+                if (est != DCVC_RT_OK) return est;
+                dec->have_ref_feature = 1;
                 /* Copy x_hat from device to host f32 */
                 size_t dn = (size_t)3 * dec->pad_h * dec->pad_w;
                 uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
