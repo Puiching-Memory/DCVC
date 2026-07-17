@@ -1,5 +1,6 @@
 #include "dcvc_rt.h"
 #include "dcvc_rt_internal.h"
+#include "dcvc_stream.h"
 #include "dcvc_bitstream.h"
 #include "dcvc_color.h"
 #include "dcvc_dpb.h"
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
 const char* dcvc_rt_version(void)
 {
@@ -86,6 +88,10 @@ struct DcvcRtEncoder {
     void* d_xhat;          /* device FP16 [1,3,padH,padW] reconstruction */
     float* ycbcr_f32;
     uint16_t* ycbcr_f16;
+    /* GPU kernel for FP16→FP32 output conversion */
+    void* d_xf32;            /* device FP32 [1,3,padH,padW] for kernel output */
+    void* kernel_so;
+    void (*k_fp16_to_f32)(const void*, float*, int, cudaStream_t);
 };
 
 struct DcvcRtDecoder {
@@ -107,6 +113,10 @@ struct DcvcRtDecoder {
     int have_ref_feature;  /* 1 once a decoder feature is available as next ref */
     float* ycbcr_f32;
     uint16_t* ycbcr_f16;
+    /* GPU kernel for FP16→FP32 output conversion */
+    void* d_xf32;            /* device FP32 [1,3,padH,padW] for kernel output */
+    void* kernel_so;
+    void (*k_fp16_to_f32)(const void*, float*, int, cudaStream_t);
 };
 
 static int prepare_input_f16(DcvcRtEncoder* enc, const DcvcRtFrame* in)
@@ -265,6 +275,15 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
     if (prepare_input_f16(enc, in) != 0) return DCVC_RT_ERR_INVALID_ARG;
 
     int is_i = (enc->frame_idx == 0) || !enc->dpb.has_ref;
+    /* P-frame QP shifting: mirrors PyTorch index_map + qp_shift.
+       index_map = [0,1,0,2,0,2,0,2], qp_shift = [0,8,4] */
+    int effective_qp = enc->cfg.qp;
+    if (!is_i) {
+        static const int dcvc_index_map[8] = {0, 1, 0, 2, 0, 2, 0, 2};
+        static const int dcvc_qp_shift[3]  = {0, 8, 4};
+        int fa_idx = dcvc_index_map[enc->frame_idx % 8];
+        effective_qp = enc->cfg.qp + dcvc_qp_shift[fa_idx];
+    }
     DcvcEngineId analysis = is_i ? DCVC_ENG_INTRA_ANALYSIS : DCVC_ENG_INTER_ANALYSIS;
     int have_nn = dcvc_trt_runner_has_engine(enc->trt, analysis);
 
@@ -293,7 +312,7 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
     if (have_nn && enc->ar_codec && is_i) {
         /* Full intra pipeline: image → analysis → hyper → AR codec → synthesis */
         size_t img_bytes = (size_t)3 * enc->pad_h * enc->pad_w * 2;
-        cudaMemcpy(enc->d_image, enc->ycbcr_f16, img_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(enc->d_image, enc->ycbcr_f16, img_bytes, cudaMemcpyHostToDevice, dcvc_stream());
         DcvcRtStatus est = dcvc_intra_encode(enc->trt, enc->ar_codec, enc->rans,
                                              enc->d_image, enc->pad_h, enc->pad_w,
                                              enc->cfg.qp, &payload, &payload_len, enc->d_xhat);
@@ -305,11 +324,11 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
     } else if (enc->inter_pl && enc->ar_inter) {
         /* Full inter P-frame pipeline */
         size_t img_bytes = (size_t)3 * enc->pad_h * enc->pad_w * 2;
-        cudaMemcpy(enc->d_image, enc->ycbcr_f16, img_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(enc->d_image, enc->ycbcr_f16, img_bytes, cudaMemcpyHostToDevice, dcvc_stream());
         const void* d_ref_feat = enc->have_ref_feature ? enc->d_dec_feature : NULL;
         const void* d_ref_pix = enc->have_ref_feature ? NULL : enc->d_xhat; /* I recon */
         DcvcRtStatus est = dcvc_inter_encode(enc->inter_pl, enc->ar_inter, enc->rans,
-            enc->d_image, d_ref_feat, d_ref_pix, enc->pad_h, enc->pad_w, enc->cfg.qp,
+            enc->d_image, d_ref_feat, d_ref_pix, enc->pad_h, enc->pad_w, effective_qp,
             &payload, &payload_len, enc->d_xhat, enc->d_dec_feature);
         if (est != DCVC_RT_OK) {
             dcvc_bw_free(&bw);
@@ -340,7 +359,7 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
         payload_len = 0;
     }
 
-    if (dcvc_bw_write_ip(&bw, is_i, enc->sps_id, enc->cfg.qp, payload, payload_len) != 0) {
+    if (dcvc_bw_write_ip(&bw, is_i, enc->sps_id, effective_qp, payload, payload_len) != 0) {
         free(payload);
         dcvc_bw_free(&bw);
         return DCVC_RT_ERR_BITSTREAM;
@@ -354,7 +373,7 @@ DcvcRtStatus dcvc_rt_encode_frame(DcvcRtEncoder* enc, const DcvcRtFrame* in, Dcv
     out->data = bw.data;
     out->size = bw.size;
     out->frame_type = is_i ? DCVC_RT_FRAME_I : DCVC_RT_FRAME_P;
-    out->qp = enc->cfg.qp;
+    out->qp = effective_qp;
     /* bw.data ownership transferred */
     bw.data = NULL;
     dcvc_bw_free(&bw);
@@ -407,6 +426,17 @@ DcvcRtDecoder* dcvc_rt_decoder_create(const DcvcRtConfig* cfg, DcvcRtStatus* out
         dec->ar_inter = dcvc_ar_codec_create(ad2, plugin_dir2, 2, &st);
     }
 
+    /* Load FP16→FP32 output kernel */
+    {
+        const char* ad_k = dec->cfg.asset_dir ? dec->cfg.asset_dir : "native/assets";
+        char kpath[640], kdir[640];
+        snprintf(kdir, sizeof(kdir), "%s/../build/plugin_demo", ad_k);
+        snprintf(kpath, sizeof(kpath), "%s/libdcvc_kernels.so", kdir);
+        dec->kernel_so = dlopen(kpath, RTLD_NOW | RTLD_GLOBAL);
+        if (dec->kernel_so)
+            *(void**)(&dec->k_fp16_to_f32) = dlsym(dec->kernel_so, "dcvc_k_fp16_to_f32_clamp");
+    }
+
     /* Device buffers (dimensions finalized at first SPS; allocate zero-size now) */
     if (out_st) *out_st = DCVC_RT_OK;
     return dec;
@@ -421,7 +451,9 @@ void dcvc_rt_decoder_destroy(DcvcRtDecoder* dec)
     dcvc_ar_codec_destroy(dec->ar_codec);
     dcvc_ar_codec_destroy(dec->ar_inter);
     dcvc_inter_pipeline_destroy(dec->inter_pl);
+    if (dec->kernel_so) dlclose(dec->kernel_so);
     cudaFree(dec->d_xhat);
+    cudaFree(dec->d_xf32);
     cudaFree(dec->d_ref_feature);
     cudaFree(dec->d_dec_feature);
     cudaFree(dec->d_ref_pixels);
@@ -462,7 +494,8 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
             {
                 size_t dn = (size_t)3 * dec->pad_h * dec->pad_w * 2;
                 size_t fn = (size_t)256 * (dec->pad_h / 8) * (dec->pad_w / 8) * 2;
-                cudaFree(dec->d_xhat);       dec->d_xhat = NULL;
+                cudaFree(dec->d_xhat);
+    cudaFree(dec->d_xf32);       dec->d_xhat = NULL;
                 cudaFree(dec->d_ref_feature);dec->d_ref_feature = NULL;
                 cudaFree(dec->d_dec_feature);dec->d_dec_feature = NULL;
                 cudaFree(dec->d_ref_pixels); dec->d_ref_pixels = NULL;
@@ -470,6 +503,8 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
                 cudaMalloc(&dec->d_ref_feature, fn);
                 cudaMalloc(&dec->d_dec_feature, fn);
                 cudaMalloc(&dec->d_ref_pixels, dn);
+                cudaFree(dec->d_xf32);
+                cudaMalloc(&dec->d_xf32, dn * sizeof(float));
                 dec->have_ref_feature = 0;
             }
             dcvc_rans_decoder_set_two(dec->rans, dec->sps.ec_part);
@@ -494,21 +529,29 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
                                                      qp, dec->d_xhat);
                 free(payload);
                 if (est != DCVC_RT_OK) return est;
-                /* Copy x_hat from device to host f32 */
+                /* Convert x_hat FP16→clamped FP32 on GPU, then D2H */
                 size_t dn = (size_t)3 * dec->pad_h * dec->pad_w;
-                uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
-                cudaMemcpy(xh16, dec->d_xhat, dn * 2, cudaMemcpyDeviceToHost);
-                for (size_t i = 0; i < dn; i++) {
-                    uint16_t h = xh16[i];
-                    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
-                    if (e == 0) { if (m == 0) f = s << 31; else { int ex = -1; while (!(m & 0x400)) { m <<= 1; ex--; } m &= 0x3ff; e = 127 + ex - 14; f = (s << 31) | (e << 23) | (m << 13); } }
-                    else if (e == 31) { f = (s << 31) | (0xff << 23) | (m << 13); }
-                    else { f = (s << 31) | ((e + 127 - 15) << 23) | (m << 13); }
-                    float v; memcpy(&v, &f, 4);
-                    if (v < 0) v = 0; if (v > 1) v = 1;
-                    dec->ycbcr_f32[i] = v;
+                if (dec->k_fp16_to_f32) {
+                    dec->k_fp16_to_f32(dec->d_xhat, dec->d_xf32, (int)dn, dcvc_stream());
+                    cudaMemcpyAsync(dec->ycbcr_f32, dec->d_xf32, dn * sizeof(float),
+                                    cudaMemcpyDeviceToHost, dcvc_stream());
+                    dcvc_sync();
+                } else {
+                    uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
+                    cudaMemcpyAsync(xh16, dec->d_xhat, dn * 2, cudaMemcpyDeviceToHost, dcvc_stream());
+                    dcvc_sync();
+                    for (size_t i = 0; i < dn; i++) {
+                        uint16_t h = xh16[i];
+                        uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
+                        if (e == 0) { if (m == 0) f = s << 31; else { int ex = -1; while (!(m & 0x400)) { m <<= 1; ex--; } m &= 0x3ff; e = 127 + ex - 14; f = (s << 31) | (e << 23) | (m << 13); } }
+                        else if (e == 31) { f = (s << 31) | (0xff << 23) | (m << 13); }
+                        else { f = (s << 31) | ((e + 127 - 15) << 23) | (m << 13); }
+                        float v; memcpy(&v, &f, 4);
+                        if (v < 0) v = 0; if (v > 1) v = 1;
+                        dec->ycbcr_f32[i] = v;
+                    }
+                    free(xh16);
                 }
-                free(xh16);
                 dec->have_ref_feature = 0;  /* after I-frame, next P references recon pixels */
             } else if (dec->inter_pl && dec->ar_inter && plen > 0 && nal == DCVC_NAL_P) {
                 /* Full inter P-frame pipeline decode */
@@ -520,21 +563,29 @@ DcvcRtStatus dcvc_rt_decode_packet(DcvcRtDecoder* dec, const uint8_t* data, size
                 free(payload);
                 if (est != DCVC_RT_OK) return est;
                 dec->have_ref_feature = 1;
-                /* Copy x_hat from device to host f32 */
+                /* Convert x_hat FP16→clamped FP32 on GPU, then D2H */
                 size_t dn = (size_t)3 * dec->pad_h * dec->pad_w;
-                uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
-                cudaMemcpy(xh16, dec->d_xhat, dn * 2, cudaMemcpyDeviceToHost);
-                for (size_t i = 0; i < dn; i++) {
-                    uint16_t h = xh16[i];
-                    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
-                    if (e == 0) { if (m == 0) f = s << 31; else { int ex = -1; while (!(m & 0x400)) { m <<= 1; ex--; } m &= 0x3ff; e = 127 + ex - 14; f = (s << 31) | (e << 23) | (m << 13); } }
-                    else if (e == 31) { f = (s << 31) | (0xff << 23) | (m << 13); }
-                    else { f = (s << 31) | ((e + 127 - 15) << 23) | (m << 13); }
-                    float v; memcpy(&v, &f, 4);
-                    if (v < 0) v = 0; if (v > 1) v = 1;
-                    dec->ycbcr_f32[i] = v;
+                if (dec->k_fp16_to_f32) {
+                    dec->k_fp16_to_f32(dec->d_xhat, dec->d_xf32, (int)dn, dcvc_stream());
+                    cudaMemcpyAsync(dec->ycbcr_f32, dec->d_xf32, dn * sizeof(float),
+                                    cudaMemcpyDeviceToHost, dcvc_stream());
+                    dcvc_sync();
+                } else {
+                    uint16_t* xh16 = (uint16_t*)malloc(dn * 2);
+                    cudaMemcpyAsync(xh16, dec->d_xhat, dn * 2, cudaMemcpyDeviceToHost, dcvc_stream());
+                    dcvc_sync();
+                    for (size_t i = 0; i < dn; i++) {
+                        uint16_t h = xh16[i];
+                        uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
+                        if (e == 0) { if (m == 0) f = s << 31; else { int ex = -1; while (!(m & 0x400)) { m <<= 1; ex--; } m &= 0x3ff; e = 127 + ex - 14; f = (s << 31) | (e << 23) | (m << 13); } }
+                        else if (e == 31) { f = (s << 31) | (0xff << 23) | (m << 13); }
+                        else { f = (s << 31) | ((e + 127 - 15) << 23) | (m << 13); }
+                        float v; memcpy(&v, &f, 4);
+                        if (v < 0) v = 0; if (v > 1) v = 1;
+                        dec->ycbcr_f32[i] = v;
+                    }
+                    free(xh16);
                 }
-                free(xh16);
             } else if (have_nn && plen > 0) {
                 dcvc_rans_decoder_set_stream(dec->rans, payload, plen);
                 DcvcRtStatus est = dcvc_trt_runner_execute(

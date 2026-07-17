@@ -7,6 +7,7 @@
 #include "dcvc_intra_pipeline.h"
 #include "dcvc_rt_internal.h"
 #include "trt_engine.h"
+#include "dcvc_stream.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -104,7 +105,7 @@ static DcvcRtStatus run_engine_io2(DcvcTrtEngine* eng, const char* in0_name,
     const char* out_name = dcvc_trt_engine_tensor_name(eng, nio - 1);
     st = dcvc_trt_engine_set_addr(eng, out_name, out_ptr);
     if (st != DCVC_RT_OK) return st;
-    return dcvc_trt_engine_execute(eng, NULL);
+    return dcvc_trt_engine_execute(eng, (void*)dcvc_stream());
 }
 
 /* ---- Pipeline state: cached CUDA buffers and loaded engines ---- */
@@ -196,8 +197,10 @@ static DcvcRtStatus load_qp_scales(DcvcTrtRunner* runner, int qp)
     st = dcvc_trt_load_qp_scale(runner, "intra_q_scale_dec", qp, qdec, 368);
     if (st != DCVC_RT_OK) return st;
 
-    cudaMemcpy(g_state.d_qenc, qenc, 368 * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_state.d_qdec, qdec, 368 * 2, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(g_state.d_qenc, qenc, 368 * 2, cudaMemcpyHostToDevice, dcvc_stream());
+    cudaStreamSynchronize(dcvc_stream());
+    cudaMemcpyAsync(g_state.d_qdec, qdec, 368 * 2, cudaMemcpyHostToDevice, dcvc_stream());
+    cudaStreamSynchronize(dcvc_stream());
     return DCVC_RT_OK;
 }
 
@@ -310,9 +313,9 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
     if (!g_state.k_round_to_int8) return DCVC_RT_ERR_IO;
     {
         int z_total = ZC * zhw;
-       g_state.k_round_to_int8(g_state.d_z, g_state.d_zhat, (int8_t*)g_state.d_z_int8, z_total, 0);
-        cudaDeviceSynchronize();
-        cudaMemcpy(g_state.z_int8_h, g_state.d_z_int8, z_total, cudaMemcpyDeviceToHost);
+       g_state.k_round_to_int8(g_state.d_z, g_state.d_zhat, (int8_t*)g_state.d_z_int8, z_total, dcvc_stream());
+        cudaMemcpyAsync(g_state.z_int8_h, g_state.d_z_int8, z_total, cudaMemcpyDeviceToHost, dcvc_stream());
+        dcvc_sync();
     }
 
     /* Step 4: z rANS encode */
@@ -391,11 +394,13 @@ DcvcRtStatus dcvc_intra_encode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
                     if (in_idx == 0) in0 = nm;
                     else if (in_idx == 1) in1 = nm;
                     in_idx++;
-                }
-            }
-        }
-        cudaFree(d_yhat);
-    }
+               }
+           }
+        st = run_engine_io2(eng, in0, yhat_dims, d_yhat, in1, qd_dims, g_state.d_qdec, d_xhat_out);
+        if (st != DCVC_RT_OK) { cudaFree(d_yhat); return st; }
+       }
+       cudaFree(d_yhat);
+   }
 
     return DCVC_RT_OK;
 }
@@ -446,7 +451,7 @@ DcvcRtStatus dcvc_intra_decode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         /* Copy z symbols to device as fp16 z_hat */
         for (size_t i = 0; i < sym_n; i++)
             g_state.z_hat_h[i] = f32h((float)syms[i]);
-        cudaMemcpy(g_state.d_zhat, g_state.z_hat_h, ZC * zhw * 2, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(g_state.d_zhat, g_state.z_hat_h, ZC * zhw * 2, cudaMemcpyHostToDevice, dcvc_stream());
     }
 
     /* Step 2: hyper_dec: z_hat → params */

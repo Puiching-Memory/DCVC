@@ -11,6 +11,18 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Truncation-based f32→f16 (matches C-side f32h, NOT round-to-nearest).
+static __device__ __forceinline__ __half f2h_trunc(float f) {
+    uint32_t x = __float_as_uint(f);
+    uint32_t s = (x >> 31) & 1;
+    int e = ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = (x >> 13) & 0x3ff;
+    if (e <= 0) { m |= 0x400; while (e < 0) { m >>= 1; e++; } e = 0; }
+    if (e >= 31) { e = 31; m = 0; }
+    uint16_t bits = (uint16_t)((s << 15) | (e << 10) | m);
+    return *reinterpret_cast<const __half*>(&bits);
+}
+
 // ---------------------------------------------------------------------------
 // launch helpers
 // ---------------------------------------------------------------------------
@@ -414,7 +426,7 @@ __global__ void mul_qfeat_broadcast_k(const __half* __restrict__ x,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= C * HW) return;
     int c = idx / HW;
-    out[idx] = __float2half_rn(__half2float(x[idx]) * __half2float(q[c]));
+    out[idx] = f2h_trunc(__half2float(x[idx]) * __half2float(q[c]));
 }
 
 extern "C" void dcvc_k_mul_qfeat_broadcast(const __half* x, const __half* q,
@@ -434,7 +446,7 @@ __global__ void broadcast_mul_k(const __half* __restrict__ in,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc * hw) return;
     int i = idx % hw;
-    out[idx] = __float2half_rn(__half2float(in[idx]) * __half2float(q[i]));
+    out[idx] = f2h_trunc(__half2float(in[idx]) * __half2float(q[i]));
 }
 
 extern "C" void dcvc_k_broadcast_mul(const __half* in, const __half* q,
@@ -450,7 +462,7 @@ extern "C" void dcvc_k_broadcast_mul(const __half* in, const __half* q,
 __global__ void add_inplace_k(__half* out, const __half* step, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    out[i] = __float2half_rn(__half2float(out[i]) + __half2float(step[i]));
+    out[i] = f2h_trunc(__half2float(out[i]) + __half2float(step[i]));
 }
 
 extern "C" void dcvc_k_add_inplace(__half* out, const __half* step,
@@ -473,8 +485,8 @@ __global__ void separate_prior_intra_k(const __half* __restrict__ pf,
     float v1 = __half2float(pf[HW + i]);
     float s0 = 1.0f / (1.0f + expf(-v0)) * 1.5f + 0.5f;
     float s1 = 1.0f / (1.0f + expf(-v1)) * 1.5f + 0.5f;
-    q_enc[i] = __float2half_rn(s0);
-    q_dec[i] = __float2half_rn(s1);
+    q_enc[i] = f2h_trunc(s0);
+    q_dec[i] = f2h_trunc(s1);
 }
 
 extern "C" void dcvc_k_separate_prior_intra(const __half* pf, __half* q_enc,
@@ -508,7 +520,7 @@ __global__ void separate_prior_video_dec_k(const __half* __restrict__ params,
     if (idx >= nc * HW) return;
     float v = __half2float(params[idx]);
     if (v < 0.5f) v = 0.5f;
-    qdec[idx] = __float2half_rn(v);
+    qdec[idx] = f2h_trunc(v);
 }
 
 extern "C" void dcvc_k_separate_prior_video_dec(const __half* params,
@@ -523,18 +535,38 @@ extern "C" void dcvc_k_separate_prior_video_dec(const __half* params,
 }
 
 // ===========================================================================
-// 21. int8_to_fp16:  out[i] = __float2half_rn((float)in[i])
+// 21. int8_to_fp16:  out[i] = f2h_trunc((float)in[i])
 //     Converts rANS decoded int8 symbols to FP16 on device.
 // ===========================================================================
 __global__ void int8_to_fp16_k(const int8_t* __restrict__ in,
                                __half* __restrict__ out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    out[i] = __float2half_rn((float)in[i]);
+    out[i] = f2h_trunc((float)in[i]);
 }
 
 extern "C" void dcvc_k_int8_to_fp16(const int8_t* in, __half* out,
                                     int N, cudaStream_t stream) {
     int g, b; launch_config(N, g, b);
     int8_to_fp16_k<<<g, b, 0, stream>>>(in, out, N);
+}
+
+// ===========================================================================
+// 22. fp16_to_f32_clamp: out[i] = clamp(__half2float(in[i]), 0, 1)
+//     Converts decoder FP16 output to clamped FP32 for host readback.
+// ===========================================================================
+__global__ void fp16_to_f32_clamp_k(const __half* __restrict__ in,
+                                    float* __restrict__ out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float v = __half2float(in[i]);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    out[i] = v;
+}
+
+extern "C" void dcvc_k_fp16_to_f32_clamp(const void* in, float* out,
+                                         int N, cudaStream_t stream) {
+    int g, b; launch_config(N, g, b);
+    fp16_to_f32_clamp_k<<<g, b, 0, stream>>>((const __half*)in, out, N);
 }

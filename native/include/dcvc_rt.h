@@ -109,3 +109,4 @@ DCVC_RT_API void dcvc_rt_frame_free_planes(DcvcRtFrame* frame);
 #endif
 
 #endif /* DCVC_RT_H */
+

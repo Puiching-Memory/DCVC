@@ -196,26 +196,9 @@ if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
   target_link_libraries(test_quality PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
 endif()
 
-if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
-  add_executable(dbg_ar_yhat tests/dbg_ar_yhat.c)
-  target_link_libraries(dbg_ar_yhat PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
-endif()
-
-if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
-  add_executable(dbg_params tests/dbg_params.c)
-  target_link_libraries(dbg_params PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
-endif()
-if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
-  add_executable(dbg_pipeline_q tests/dbg_pipeline_q.c)
-  target_link_libraries(dbg_pipeline_q PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
-endif()
-if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
-  add_executable(dbg_ref_match tests/dbg_ref_match.c)
-  target_link_libraries(dbg_ref_match PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
-endif()
-
 # Performance benchmark
 if(DCVC_RT_HAS_TENSORRT AND DCVC_RT_BUILD_TESTS)
   add_executable(test_perf tests/test_perf.c)
   target_link_libraries(test_perf PRIVATE dcvc_rt ${CMAKE_DL_LIBS} m)
 endif()
+
