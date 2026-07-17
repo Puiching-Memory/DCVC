@@ -82,6 +82,7 @@ static void pn_npy_free(PnNpy* o) { free(o->i32); free(o->fp16); o->i32 = o->fp1
 
 /* ---- round_to_int8 kernel signature ---- */
 typedef void (*fn_round_to_int8)(const void*, void*, int8_t*, int, cudaStream_t);
+typedef void (*fn_int8_to_fp16)(const void*, void*, int, cudaStream_t);
 
 /* ---- Engine binding helper: set shape+addr for in0 and out, then execute ---- */
 static DcvcRtStatus run_engine_io2(DcvcTrtEngine* eng, const char* in0_name,
@@ -127,6 +128,7 @@ typedef struct {
     /* CUDA kernel */
     void* kernel_so;
     fn_round_to_int8 k_round_to_int8;
+    fn_int8_to_fp16 k_int8_to_fp16;
 } PipelineState;
 
 static PipelineState g_state = {0};
@@ -180,6 +182,7 @@ static DcvcRtStatus ps_ensure(int H, int W)
         }
         if (g_state.kernel_so) {
             g_state.k_round_to_int8 = (fn_round_to_int8)dlsym(g_state.kernel_so, "dcvc_k_round_to_int8");
+            g_state.k_int8_to_fp16 = (fn_int8_to_fp16)dlsym(g_state.kernel_so, "dcvc_k_int8_to_fp16");
         }
     }
 
@@ -448,10 +451,9 @@ DcvcRtStatus dcvc_intra_decode(DcvcTrtRunner* runner, DcvcArCodec* ar_codec,
         dcvc_rans_decoder_decode_z(rans_dec, z_total, 0, start_offset, per_channel);
         int8_t* syms = NULL; size_t sym_n = 0;
         dcvc_rans_decoder_get_symbols(rans_dec, (int8_t**)&syms, &sym_n);
-        /* Copy z symbols to device as fp16 z_hat */
-        for (size_t i = 0; i < sym_n; i++)
-            g_state.z_hat_h[i] = f32h((float)syms[i]);
-        cudaMemcpyAsync(g_state.d_zhat, g_state.z_hat_h, ZC * zhw * 2, cudaMemcpyHostToDevice, dcvc_stream());
+        /* Convert z int8 symbols → fp16 z_hat on GPU (reuse d_z_int8 buffer) */
+        cudaMemcpyAsync(g_state.d_z_int8, syms, ZC * zhw, cudaMemcpyHostToDevice, dcvc_stream());
+        g_state.k_int8_to_fp16(g_state.d_z_int8, g_state.d_zhat, ZC * zhw, dcvc_stream());
     }
 
     /* Step 2: hyper_dec: z_hat → params */

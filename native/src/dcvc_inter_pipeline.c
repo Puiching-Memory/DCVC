@@ -57,6 +57,7 @@ static float h2f(uint16_t h)
 typedef void (*fn_round_to_int8)(const void*, void*, int8_t*, int, cudaStream_t);
 typedef void (*fn_pixel_unshuffle_8)(const void*, void*, int, int, cudaStream_t);
 typedef void (*fn_mul_qfeat_broadcast)(const void*, const void*, void*, int, int, cudaStream_t);
+typedef void (*fn_int8_to_fp16)(const void*, void*, int, cudaStream_t);
 
 /* ---- Minimal npy reader (int32 + fp16) ---- */
 typedef struct { int dims[4]; size_t elems; int32_t* i32; uint16_t* fp16; } PnNpy;
@@ -157,10 +158,14 @@ struct DcvcInterPipeline {
     fn_round_to_int8 k_round_to_int8;
     fn_pixel_unshuffle_8 k_pixel_unshuffle_8;
     fn_mul_qfeat_broadcast k_mul_qfeat_broadcast;
+    fn_int8_to_fp16 k_int8_to_fp16;
     int H, W, fH, fW, yH, yW, zH, zW;
     void *d_feature, *d_pixunshuf, *d_x1, *d_ctx_t, *d_ctx, *d_y, *d_z, *d_zhat, *d_z_int8;
     void *d_hier, *d_temporal, *d_pf_in, *d_params, *d_yhat, *d_fdec;
     void *d_q_enc, *d_q_dec, *d_q_feat, *d_q_recon, *d_q_ones;
+    /* Pre-loaded full QP banks (device-resident, loaded once at init) */
+    void *d_bank_enc, *d_bank_dec, *d_bank_feat, *d_bank_recon;
+    int qp_num_enc, qp_num_dec, qp_num_feat, qp_num_recon;
     int8_t* z_int8_h;
     uint16_t* z_hat_h;
 };
@@ -180,9 +185,15 @@ static void ips_free_bufs(DcvcInterPipeline* p)
     cudaFree(p->d_params); cudaFree(p->d_yhat); cudaFree(p->d_fdec);
     cudaFree(p->d_q_enc); cudaFree(p->d_q_dec); cudaFree(p->d_q_feat);
     cudaFree(p->d_q_recon); cudaFree(p->d_q_ones);
+    cudaFree(p->d_bank_enc); cudaFree(p->d_bank_dec);
+    cudaFree(p->d_bank_feat); cudaFree(p->d_bank_recon);
+    p->d_bank_enc = NULL;
     free(p->z_int8_h); free(p->z_hat_h);
     p->d_feature = NULL;
 }
+
+static DcvcRtStatus preload_qp_bank(DcvcInterPipeline* p, const char* bank,
+                                        void** d_bank_out, int* qp_num_out, int channels);
 
 static DcvcRtStatus ips_ensure(DcvcInterPipeline* p, int H, int W)
 {
@@ -192,6 +203,7 @@ static DcvcRtStatus ips_ensure(DcvcInterPipeline* p, int H, int W)
     p->fH = H / 8;  p->fW = W / 8;
     p->yH = H / 16; p->yW = W / 16;
     p->zH = H / 64; p->zW = W / 64;
+    DcvcRtStatus st = DCVC_RT_OK;
     int fHW = p->fH * p->fW, yHW = p->yH * p->yW, zHW = p->zH * p->zW;
     const int D = DCVC_RT_CH_D, SRC = DCVC_RT_CH_SRC_D, YC = DCVC_RT_CH_Y_INTER, ZC = DCVC_RT_CH_Z, RECON = 320;
 
@@ -226,6 +238,12 @@ static DcvcRtStatus ips_ensure(DcvcInterPipeline* p, int H, int W)
 
     uint16_t ones[D]; for (int i = 0; i < D; i++) ones[i] = f32h(1.0f);
     cudaMemcpyAsync(p->d_q_ones, ones, D * 2, cudaMemcpyHostToDevice, dcvc_stream());
+
+    /* Pre-load all QP banks to device-resident buffers (one-time cost) */
+    if ((st = preload_qp_bank(p, "inter_q_encoder",  &p->d_bank_enc,  &p->qp_num_enc,  D)) != DCVC_RT_OK) return st;
+    if ((st = preload_qp_bank(p, "inter_q_decoder",  &p->d_bank_dec,  &p->qp_num_dec,  D)) != DCVC_RT_OK) return st;
+    if ((st = preload_qp_bank(p, "inter_q_feature",  &p->d_bank_feat, &p->qp_num_feat, D)) != DCVC_RT_OK) return st;
+    if ((st = preload_qp_bank(p, "inter_q_recon",    &p->d_bank_recon,&p->qp_num_recon, RECON)) != DCVC_RT_OK) return st;
     return DCVC_RT_OK;
 }
 
@@ -245,8 +263,10 @@ static DcvcRtStatus build_ref_feature(DcvcInterPipeline* p, const void* d_ref_fe
     return run1(p->eng[E_FADAP_I], "in0", d, p->d_pixunshuf, p->d_feature);
 }
 
-static DcvcRtStatus load_qp(DcvcInterPipeline* p, const char* bank, int qp,
-                            void* d_out, int channels)
+/* Pre-load a full QP bank into a device-resident buffer at init time.
+ * Returns qp_num via out param; caller caches the device pointer. */
+static DcvcRtStatus preload_qp_bank(DcvcInterPipeline* p, const char* bank,
+                                    void** d_bank_out, int* qp_num_out, int channels)
 {
     char path[640];
     snprintf(path, sizeof(path), "%s/qp/%s.bin", p->asset_dir, bank);
@@ -254,15 +274,33 @@ static DcvcRtStatus load_qp(DcvcInterPipeline* p, const char* bank, int qp,
     if (!f) return DCVC_RT_ERR_IO;
     int32_t qp_num = 0, ch = 0;
     if (fread(&qp_num, 4, 1, f) != 1 || fread(&ch, 4, 1, f) != 1) { fclose(f); return DCVC_RT_ERR_IO; }
-    if (ch != channels || qp < 0 || qp >= qp_num) { fclose(f); return DCVC_RT_ERR_INVALID_ARG; }
-    if (fseek(f, (long)(8 + (size_t)qp * channels * 2), SEEK_SET) != 0) { fclose(f); return DCVC_RT_ERR_IO; }
-    uint16_t* tmp = malloc(channels * 2);
-    size_t got = fread(tmp, 2, channels, f);
+    if (ch != channels) { fclose(f); return DCVC_RT_ERR_INVALID_ARG; }
+    size_t total = (size_t)qp_num * channels * 2;
+    uint16_t* host = malloc(total);
+    if (fread(host, 1, total, f) != total) { fclose(f); free(host); return DCVC_RT_ERR_IO; }
     fclose(f);
-    if (got != (size_t)channels) { free(tmp); return DCVC_RT_ERR_IO; }
-    cudaMemcpyAsync(d_out, tmp, channels * 2, cudaMemcpyHostToDevice, dcvc_stream());
-    cudaStreamSynchronize(dcvc_stream());
-    free(tmp);
+    void* dev;
+    cudaMalloc(&dev, total);
+    cudaMemcpy(dev, host, total, cudaMemcpyHostToDevice);
+    free(host);
+    *d_bank_out = dev;
+    *qp_num_out = qp_num;
+    return DCVC_RT_OK;
+}
+
+/* Slice one QP row from the pre-loaded device bank (D2D, same-stream, no sync). */
+static DcvcRtStatus load_qp(DcvcInterPipeline* p, const char* bank, int qp,
+                            void* d_out, int channels)
+{
+    void* d_bank; int qp_num;
+    if (strcmp(bank, "inter_q_encoder") == 0)  { d_bank = p->d_bank_enc;  qp_num = p->qp_num_enc; }
+    else if (strcmp(bank, "inter_q_decoder") == 0) { d_bank = p->d_bank_dec;  qp_num = p->qp_num_dec; }
+    else if (strcmp(bank, "inter_q_feature") == 0) { d_bank = p->d_bank_feat; qp_num = p->qp_num_feat; }
+    else if (strcmp(bank, "inter_q_recon") == 0)   { d_bank = p->d_bank_recon; qp_num = p->qp_num_recon; }
+    else return DCVC_RT_ERR_INVALID_ARG;
+    if (!d_bank || qp < 0 || qp >= qp_num) return DCVC_RT_ERR_INVALID_ARG;
+    cudaMemcpyAsync(d_out, (char*)d_bank + (size_t)qp * channels * 2,
+                    channels * 2, cudaMemcpyDeviceToDevice, dcvc_stream());
     return DCVC_RT_OK;
 }
 
@@ -314,7 +352,8 @@ DcvcInterPipeline* dcvc_inter_pipeline_create(const char* asset_dir,
     if (!p->k_round_to_int8) { st = DCVC_RT_ERR_IO; goto fail; }
     p->k_pixel_unshuffle_8 = (fn_pixel_unshuffle_8)dlsym(p->kernel_so, "dcvc_k_pixel_unshuffle_8");
     p->k_mul_qfeat_broadcast = (fn_mul_qfeat_broadcast)dlsym(p->kernel_so, "dcvc_k_mul_qfeat_broadcast");
-    if (!p->k_pixel_unshuffle_8 || !p->k_mul_qfeat_broadcast) { st = DCVC_RT_ERR_IO; goto fail; }
+    p->k_int8_to_fp16 = (fn_int8_to_fp16)dlsym(p->kernel_so, "dcvc_k_int8_to_fp16");
+    if (!p->k_pixel_unshuffle_8 || !p->k_mul_qfeat_broadcast || !p->k_int8_to_fp16) { st = DCVC_RT_ERR_IO; goto fail; }
     for (int i = 0; i < INTER_N_ENG; i++) {
         snprintf(path, sizeof(path), "%s/engines/%s.engine", p->asset_dir, k_eng_files[i]);
         p->eng[i] = dcvc_trt_engine_load(path, p->plugin_dir, &st);
@@ -389,25 +428,23 @@ DcvcRtStatus dcvc_inter_encode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
 
     /* 6. round_to_int8 */
     { int zt = ZC * zHW;
-      p->k_round_to_int8(p->d_z, p->d_zhat, (int8_t*)p->d_z_int8, zt, 0);
+      p->k_round_to_int8(p->d_z, p->d_zhat, (int8_t*)p->d_z_int8, zt, dcvc_stream());
       cudaMemcpyAsync(p->z_int8_h, p->d_z_int8, zt, cudaMemcpyDeviceToHost, dcvc_stream());
       dcvc_sync(); }
 
-    /* 7. z rANS encode */
+    /* === OVERLAP: start z rANS encode on worker thread, queue HDEC+TEMP on GPU === */
+    /* 7a. Start z rANS encode (non-blocking — runs on MultiThread worker) */
     { int zt = ZC * zHW;
-      /* Reset pending symbol list each frame; CDFs persist in the encoder.
-       * Without this, m_pendingEncodingList accumulates symbols across frames
-       * and the z bitstream is corrupted from the 2nd P-frame onward. */
       dcvc_rans_encoder_reset(rans_enc);
       dcvc_rans_encoder_encode_z(rans_enc, p->z_int8_h, zt, 0, qp * ZC, zHW);
       dcvc_rans_encoder_flush(rans_enc); }
 
-    /* 8. hyper_dec(z_hat) → hier */
+    /* 7b. Queue GPU work that does NOT depend on rANS result */
+    /* hyper_dec(d_zhat) → hier — d_zhat already on device from step 6 */
     { int32_t zd[4]={1,ZC,zH,zW};
       st = run1(p->eng[E_HDEC], "in0", zd, p->d_zhat, p->d_hier);
       if (st != DCVC_RT_OK) return st; }
-
-    /* 9. temporal_prior(ctx_t) → temporal */
+    /* temporal_prior(ctx_t) → temporal — independent of z rANS */
     { int32_t cd[4]={1,D,fH,fW};
       st = run1(p->eng[E_TEMP], "in0", cd, p->d_ctx_t, p->d_temporal);
       if (st != DCVC_RT_OK) return st; }
@@ -484,33 +521,35 @@ DcvcRtStatus dcvc_inter_decode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
     if ((st = load_qp(p, "inter_q_recon", qp, p->d_q_recon, RECON)) != DCVC_RT_OK) return st;
     if ((st = load_z_cdfs(p, 0, rans_dec)) != DCVC_RT_OK) return st;
 
-    /* 1. z rANS decode → z_hat */
+    /* === OVERLAP: start z rANS on worker thread, then queue independent GPU work === */
+    /* 1a. Start z rANS decode (non-blocking — runs on MultiThread worker) */
     { int zt = ZC * zHW;
       dcvc_rans_decoder_set_stream(rans_dec, z_payload, z_len);
-      dcvc_rans_decoder_decode_z(rans_dec, zt, 0, qp * ZC, zHW);
-      int8_t* syms = NULL; size_t sn = 0;
-      dcvc_rans_decoder_get_symbols(rans_dec, (int8_t**)&syms, &sn);
-      for (size_t i = 0; i < sn; i++) p->z_hat_h[i] = f32h((float)syms[i]);
-      cudaMemcpyAsync(p->d_zhat, p->z_hat_h, ZC*zHW*2, cudaMemcpyHostToDevice, dcvc_stream()); }
+      dcvc_rans_decoder_decode_z(rans_dec, zt, 0, qp * ZC, zHW); }
 
-    /* 2. ref feature */
+    /* 1b. Queue GPU work that does NOT depend on z_hat (runs during rANS) */
+    /* ref feature */
     st = build_ref_feature(p, d_ref_feature, d_ref_pixels, H, W);
     if (st != DCVC_RT_OK) return st;
-
-    /* 3. fe1(feature, ones) → x1 ; ctx_t */
+    /* fe1(feature, ones) → x1 ; ctx_t = x1·q_feat */
     { int32_t fd[4]={1,D,fH,fW}, qd[4]={1,D,1,1};
       st = run2(p->eng[E_FE1], "in0", fd, p->d_feature, "q", qd, p->d_q_ones, p->d_x1);
       if (st != DCVC_RT_OK) return st; }
     mul_qfeat_broadcast(p);
-
-    /* 4. hyper_dec(z_hat) → hier */
-    { int32_t zd[4]={1,ZC,zH,zW};
-      st = run1(p->eng[E_HDEC], "in0", zd, p->d_zhat, p->d_hier);
-      if (st != DCVC_RT_OK) return st; }
-
-    /* 5. temporal_prior(ctx_t) → temporal */
+    /* temporal_prior(ctx_t) → temporal — independent of z_hat */
     { int32_t cd[4]={1,D,fH,fW};
       st = run1(p->eng[E_TEMP], "in0", cd, p->d_ctx_t, p->d_temporal);
+      if (st != DCVC_RT_OK) return st; }
+
+    /* 1c. Block until z rANS completes, then H2D + int8_to_fp16 (GPU catches up here) */
+    { int8_t* syms = NULL; size_t sn = 0;
+      dcvc_rans_decoder_get_symbols(rans_dec, (int8_t**)&syms, &sn);
+      cudaMemcpyAsync(p->d_z_int8, syms, ZC*zHW, cudaMemcpyHostToDevice, dcvc_stream());
+      p->k_int8_to_fp16(p->d_z_int8, p->d_zhat, ZC*zHW, dcvc_stream()); }
+
+    /* 2. hyper_dec(z_hat) → hier — now z_hat is ready */
+    { int32_t zd[4]={1,ZC,zH,zW};
+      st = run1(p->eng[E_HDEC], "in0", zd, p->d_zhat, p->d_hier);
       if (st != DCVC_RT_OK) return st; }
 
     /* 6. cat → prior_fusion → params */
@@ -541,6 +580,7 @@ DcvcRtStatus dcvc_inter_decode(DcvcInterPipeline* p, DcvcArCodec* ar_codec,
 
     if (d_ref_feature_out)
         cudaMemcpyAsync(d_ref_feature_out, p->d_fdec, D*(fH*fW)*2, cudaMemcpyDeviceToDevice, dcvc_stream());
+    dcvc_sync();
     return DCVC_RT_OK;
 }
 
