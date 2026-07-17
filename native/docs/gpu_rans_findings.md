@@ -140,3 +140,94 @@ CUDA_VISIBLE_DEVICES=0 ./native/build/test_quality 32          # 质量+BPP
 CUDA_VISIBLE_DEVICES=0 ./native/build/test_perf 32 8           # 性能
 cd native && ctest --test-dir build --output-on-failure         # 全量 15 项
 ```
+
+
+---
+
+## 8. CUDA Graphs 探索结论（2026-07-17）：同样净零，已回退
+
+继 shape/address 缓存（§7）无效后，尝试了 host-bound 假设下收益最大的方向：**CUDA Graphs**——把稳态 P 帧的 enqueue 序列录成图，一次 `cudaGraphLaunch` 替代多次 `enqueueV3`。
+
+### 8.1 实施与验证（技术上成功）
+- TRT 11.0 + CUDA 13.2 全支持图捕获。实现了 `GraphSeg` 机制（warmup→capture→replay 三态，失败自动降级为 raw）。
+- 把 encode 的两个纯-GPU 段 E1（5 引擎：ref→fe1→fe2→enc→henc→round）和 E2（3 引擎：hdec→temp→pfus）做进图，分段边界是 rANS 的 D2H/sync host seam。
+- 插桩确认：**capture 成功 + replay 生效**（`cudaGraphLaunch` 在 frame 3+ 触发），bit-exact、ctest 15/15 PASS。
+
+### 8.2 性能：净零（实测，高帧 A/B）
+| 变体（100 帧 × 5 次，e2e 中位） | 延迟 |
+|---|---|
+| 基线 | **20.26 ms** |
+| 图化（E1+E2，确认 replay） | 20.58 ms |
+
+图化版本**没有任何改善，反而略慢 ~0.3ms**（噪声内）。决定性否定。
+
+### 8.3 为什么失败（两个根因，均已实测验证）
+**A. host enqueue 本就不在关键路径上（与 GPU 重叠）**
+shape-cache 那轮已证明 enqueueV3 是 ~6.6ms 的 host CPU 时间。但它是**与 GPU 执行重叠**的——host 排下一个 engine 的同时 GPU 在跑当前 engine。删掉它不减 wall-clock。§7 的 GPU 利用率 29% 的那个 12.8ms 空闲，**不是 enqueue 造成的，是 sync stall 造成的**（`dcvc_sync` 把 GPU 排空 + CPU rANS 期间 GPU 干等）。
+
+**B. 段太小，图 launch 抵消不掉手动 enqueue**
+CUDA Graphs 的优势在于**节点很多**（几十上百）时一次 launch 替代百次 enqueue。我们的段只有 3–5 个节点，`cudaGraphLaunch` 自身开销与 3–5 次 `enqueueV3` 相当，没有 launch-amortization 收益。
+
+### 8.4 决策
+图代码**全部回退**（无收益 + 增加复杂度/风险）。保留 shape/address 缓存（§7，正确且无害）。本环境的真正瓶颈是 **rANS sync stall**，而它只能靠「把 rANS 移出 CPU sync 路径」解决——但 §6 已证明 GPU rANS 净负面。所以在 256×256 + CPU rANS 架构下，host-side 优化（shape 缓存 / CUDA Graphs）均无法降低延迟。
+
+### 8.5 复现命令
+```bash
+# 干净基线（shape-cache 保留，无 graph 代码）
+cd /root/workspace/DCVC && cd native && cmake --build build -j8
+CUDA_VISIBLE_DEVICES=0 ./native/build/test_perf 32 100    # e2e ~20.2ms
+```
+
+
+---
+
+## 9. 决定性发现：原生比 PyTorch 慢 2×，根因是 sync 拓扑（不是 TRT）
+
+### 9.1 实测对比（`bench_torch.py`，同分辨率/QP/帧/A30）
+| | ENCODE | DECODE | E2E |
+|---|---|---|---|
+| **原生（当前）** | 10.9 ms | 9.4 ms | **20.3 ms** |
+| **PyTorch 原版** | 5.4 ms | 4.9 ms | **10.3 ms** |
+| 倍率 | 2.0× | 1.9× | **1.96×** |
+
+原生全面慢 ~2×。PyTorch 比 TRT 快**不是 TRT 本身的问题**——是原生代码的流水线拓扑错了。
+
+### 9.2 根因：rANS 处理方式（关键，颠覆本文 §6–§8）
+两个版本的 rANS **都是 CPU 计算**（PyTorch 也是 `.cpu().numpy()`，见 `src/models/entropy_models.py:48,51`，rANS 库同源 `MLCodec_extensions_cpp`）。差异完全在**如何把 CPU rANS 与 GPU NN 推理重叠**：
+
+**PyTorch（`video_model.py:299-338`）— event 驱动、GPU 几乎不空转：**
+```
+NN stream:   enc→henc→round_z →[EVENT z]→ params→AR(y) →[EVENT y]→ decoder→recon
+rANS stream:                              wait(z_evt)→enc_z  wait(y_evt)→enc_y enc_y flush
+            （NN 与 CPU-rANS 真并发；只在真实数据依赖处 event-wait）
+最终：1 次 synchronize（结尾）
+```
+
+**原生（`dcvc_inter_pipeline.c` + `dcvc_ar_codec.c`）— 6 次 full-GPU drain：**
+```
+single stream: enc→henc→round_z
+  ──dcvc_sync()── [排空 GPU] ── cudaMemcpy z→host ── CPU enc_z
+  E2: hdec→temp→pfus
+  ──dcvc_ar_codec: ──dcvc_sync()── [排空 GPU] ── packed→host ── CPU enc_y r0
+                   ──dcvc_sync()── [排空 GPU] ── packed→host ── CPU enc_y r1   ... (decode 同理)
+6× dcvc_sync = 6 次 GPU 完全排空 = 每次 CPU-rANS 期间 GPU 干等
+```
+
+### 9.3 推翻本文前面的错误结论
+- **§6「z rANS 已异步并行、不在关键路径」**：对 z 编码成立（确实用 worker 线程重叠了），但 **AR 的 y-rANS 不是**——`dcvc_ar_codec.c` 里 4 处 `dcvc_sync()` 在 CPU rANS 前排空了 GPU。这是 ~2× 差距的主要来源。
+- **§7 shape 缓存、§8 CUDA Graphs 无效**：都正确，但它们**治错了病**。真正的病是 sync stall，不是 enqueue 开销。enqueue 与 GPU 重叠（§8.3A），所以删掉它没用；sync 把 GPU 排空，才是延迟来源。
+
+### 9.4 可行方向（治本，预期 ~2× 收益）
+把原生改成 PyTorch 的 event 拓扑：CPU rANS 跑在独立高优先级 CUDA 流上，用 `cudaEvent` 在真实依赖处 wait，**不在 rANS 前 sync**。具体：
+1. AR 的 `dcvc_sync()+D2H` 改成 `cudaMemcpyAsync` + record event；rANS 在等待 event 的同时，GPU 继续跑下一个独立的 NN engine。
+2. 用专用 rANS 流（`priority=-1`），与 NN 流并发。
+3. 全帧只在最后 1 次 `synchronize` 收尾。
+
+这是唯一能追平 PyTorch 的方向。**不是 GPU rANS（§6 已证伪），而是 CPU rANS 的正确异步化。** 之前的 host-side 微优化（shape/graph）应全部放弃，集中做这个。
+
+### 9.5 复现命令
+```bash
+cd /root/workspace/DCVC
+.venv/bin/python bench_torch.py 32 50          # PyTorch: 10.3ms e2e
+CUDA_VISIBLE_DEVICES=0 ./native/build/test_perf 32 100   # 原生: 20.3ms e2e
+```

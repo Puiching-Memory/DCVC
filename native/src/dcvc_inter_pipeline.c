@@ -110,33 +110,44 @@ static const char* eng_out_name(DcvcTrtEngine* eng)
 static DcvcRtStatus bind_in(DcvcTrtEngine* eng, const char* name,
                             const int32_t* dims, void* ptr)
 {
-    DcvcRtStatus st = dcvc_trt_engine_set_shape(eng, name, dims, 4);
-    if (st != DCVC_RT_OK) return st;
+    /* Input dynamic shapes are resolution-derived and identical every frame,
+     * so setInputShape only needs to run once (until the priming flag clears).
+     * Tensor addresses are re-bound every call — output buffers may differ
+     * between an encoder and decoder sharing this pipeline. */
+    if (!dcvc_trt_engine_bound(eng)) {
+        DcvcRtStatus st = dcvc_trt_engine_set_shape(eng, name, dims, 4);
+        if (st != DCVC_RT_OK) return st;
+    }
     return dcvc_trt_engine_set_addr(eng, name, ptr);
 }
 static DcvcRtStatus run1(DcvcTrtEngine* eng, const char* n0, const int32_t* d0, void* p0, void* out)
 {
+    int was_bound = dcvc_trt_engine_bound(eng);
     DcvcRtStatus st = bind_in(eng, n0, d0, p0);
     if (st != DCVC_RT_OK) return st;
     st = dcvc_trt_engine_set_addr(eng, eng_out_name(eng), out);
     if (st != DCVC_RT_OK) return st;
+    if (!was_bound) dcvc_trt_engine_set_bound(eng, 1);
     return dcvc_trt_engine_execute(eng, (void*)dcvc_stream());
 }
 static DcvcRtStatus run2(DcvcTrtEngine* eng, const char* n0, const int32_t* d0, void* p0,
                          const char* n1, const int32_t* d1, void* p1, void* out)
 {
+    int was_bound = dcvc_trt_engine_bound(eng);
     DcvcRtStatus st = bind_in(eng, n0, d0, p0);
     if (st != DCVC_RT_OK) return st;
     st = bind_in(eng, n1, d1, p1);
     if (st != DCVC_RT_OK) return st;
     st = dcvc_trt_engine_set_addr(eng, eng_out_name(eng), out);
     if (st != DCVC_RT_OK) return st;
+    if (!was_bound) dcvc_trt_engine_set_bound(eng, 1);
     return dcvc_trt_engine_execute(eng, (void*)dcvc_stream());
 }
 static DcvcRtStatus run3(DcvcTrtEngine* eng, const char* n0, const int32_t* d0, void* p0,
                          const char* n1, const int32_t* d1, void* p1,
                          const char* n2, const int32_t* d2, void* p2, void* out)
 {
+    int was_bound = dcvc_trt_engine_bound(eng);
     DcvcRtStatus st = bind_in(eng, n0, d0, p0);
     if (st != DCVC_RT_OK) return st;
     st = bind_in(eng, n1, d1, p1);
@@ -145,6 +156,7 @@ static DcvcRtStatus run3(DcvcTrtEngine* eng, const char* n0, const int32_t* d0, 
     if (st != DCVC_RT_OK) return st;
     st = dcvc_trt_engine_set_addr(eng, eng_out_name(eng), out);
     if (st != DCVC_RT_OK) return st;
+    if (!was_bound) dcvc_trt_engine_set_bound(eng, 1);
     return dcvc_trt_engine_execute(eng, (void*)dcvc_stream());
 }
 
@@ -199,6 +211,9 @@ static DcvcRtStatus ips_ensure(DcvcInterPipeline* p, int H, int W)
 {
     if (p->H == H && p->W == W && p->d_feature) return DCVC_RT_OK;
     ips_free_bufs(p);
+    /* Resolution/buffers changed: clear primed engine binding cache. */
+    for (int i = 0; i < INTER_N_ENG; i++)
+        if (p->eng[i]) dcvc_trt_engine_set_bound(p->eng[i], 0);
     p->H = H; p->W = W;
     p->fH = H / 8;  p->fW = W / 8;
     p->yH = H / 16; p->yW = W / 16;

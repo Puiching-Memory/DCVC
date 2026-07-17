@@ -41,6 +41,7 @@ struct DcvcTrtEngine {
     IRuntime* runtime = nullptr;
     ICudaEngine* engine = nullptr;
     IExecutionContext* context = nullptr;
+    bool inputs_bound = false;   /* primed binding cache (see dcvc_trt_engine_bound) */
 
     ~DcvcTrtEngine() {
         if (context) delete context;
@@ -164,6 +165,14 @@ DcvcRtStatus dcvc_trt_engine_execute(DcvcTrtEngine* eng, void* cuda_stream) {
     if (!eng->context->enqueueV3(stream))
         return DCVC_RT_ERR_TRT;
     return DCVC_RT_OK;
+}
+
+int dcvc_trt_engine_bound(const DcvcTrtEngine* eng) {
+    return (eng && eng->inputs_bound) ? 1 : 0;
+}
+
+void dcvc_trt_engine_set_bound(DcvcTrtEngine* eng, int bound) {
+    if (eng) eng->inputs_bound = (bound != 0);
 }
 
 } // extern "C"

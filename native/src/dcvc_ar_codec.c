@@ -189,6 +189,10 @@ static DcvcRtStatus ws_ensure(DcvcArCodec* c, int H, int W)
     int hw = H * W;
     if (c->ws.hw == hw && c->ws.n_ch == c->n_ch) return DCVC_RT_OK;
     ws_free(&c->ws);
+    /* Dimensions changed: clear primed engine binding cache. */
+    if (c->eng_spatial_prior) dcvc_trt_engine_set_bound(c->eng_spatial_prior, 0);
+    for (int i = 0; i < 4; i++)
+        if (c->eng_adaptor[i]) dcvc_trt_engine_set_bound(c->eng_adaptor[i], 0);
 
     int nc = c->n_ch, r;
     if (c->passes == 4) r = nc / 4;
@@ -481,8 +485,14 @@ static DcvcRtStatus run_spatial_prior_2x(DcvcArCodec* c, void* d_yhat_step,
     cudaMemcpyAsync((char*)ws->d_cat + (size_t)nc * hw * 2, d_params,
                (size_t)3 * nc * hw * 2, cudaMemcpyDeviceToDevice, dcvc_stream());
 
-    int32_t in_dims[4] = {1, 4 * nc, H, W};
-    dcvc_trt_engine_set_shape(c->eng_spatial_prior, "in0", in_dims, 4);
+    /* Cache the input shape (resolution-derived, stable); rebind addresses
+     * every call — d_cat/d_sp_out are internal and stable, but rebinding is
+     * cheap and keeps the path robust to buffer changes. */
+    if (!dcvc_trt_engine_bound(c->eng_spatial_prior)) {
+        int32_t in_dims[4] = {1, 4 * nc, H, W};
+        dcvc_trt_engine_set_shape(c->eng_spatial_prior, "in0", in_dims, 4);
+        dcvc_trt_engine_set_bound(c->eng_spatial_prior, 1);
+    }
     dcvc_trt_engine_set_addr(c->eng_spatial_prior, "in0", ws->d_cat);
     int nio = dcvc_trt_engine_num_io(c->eng_spatial_prior);
     const char* out_name = dcvc_trt_engine_tensor_name(c->eng_spatial_prior, nio - 1);

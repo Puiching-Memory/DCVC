@@ -34,6 +34,14 @@ DcvcRtStatus dcvc_trt_engine_get_shape(const DcvcTrtEngine* eng, const char* nam
 DcvcRtStatus dcvc_trt_engine_set_addr(DcvcTrtEngine* eng, const char* name, void* dev_ptr);
 DcvcRtStatus dcvc_trt_engine_execute(DcvcTrtEngine* eng, void* cuda_stream);
 
+/* At a fixed resolution every input shape and tensor address is identical
+ * across frames. An engine is "bound" once its inputs/outputs have been set
+ * so subsequent frames skip the redundant setInputShape/setTensorAddress host
+ * calls. Clear the flag when shapes/addresses may have changed (resolution
+ * change or buffer reallocation). */
+int  dcvc_trt_engine_bound(const DcvcTrtEngine* eng);
+void dcvc_trt_engine_set_bound(DcvcTrtEngine* eng, int bound);
+
 #ifdef __cplusplus
 }
 #endif
