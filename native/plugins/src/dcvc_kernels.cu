@@ -570,3 +570,99 @@ extern "C" void dcvc_k_fp16_to_f32_clamp(const void* in, float* out,
     int g, b; launch_config(N, g, b);
     fp16_to_f32_clamp_k<<<g, b, 0, stream>>>((const __half*)in, out, N);
 }
+
+// ===========================================================================
+// 23. yuv420_to_padded_fp16: YUV420P 8-bit planar -> padded YCbCr444 FP16 planar.
+//     Replaces dcvc_rt.c prepare_input_f16(): /255, 2x nearest UV upsample,
+//     replicate-edge padding. f32->f16 uses TRUNCATION to match color.c.
+//     Layout: out CHW [1,pad_h,pad_w] x3; y in [in_h,in_w], u/v in [in_h/2,in_w/2].
+// ===========================================================================
+__global__ void yuv420_to_padded_fp16_k(const uint8_t* __restrict__ y,
+                                        int y_stride,
+                                        const uint8_t* __restrict__ u, int u_stride,
+                                        const uint8_t* __restrict__ v, int v_stride,
+                                        int in_w, int in_h,
+                                        __half* __restrict__ out, int pad_w, int pad_h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= pad_w || j >= pad_h) return;
+    int is = i < in_w ? i : in_w - 1;
+    int js = j < in_h ? j : in_h - 1;
+    int uj = js / 2, ui = is / 2;
+    float yv = y[js * y_stride + is] * (1.0f / 255.0f);
+    float uv = u[uj * u_stride + ui] * (1.0f / 255.0f);
+    float vv = v[uj * v_stride + ui] * (1.0f / 255.0f);
+    int plane = pad_h * pad_w;
+    out[0 * plane + j * pad_w + i] = f2h_trunc(yv);
+    out[1 * plane + j * pad_w + i] = f2h_trunc(uv);
+    out[2 * plane + j * pad_w + i] = f2h_trunc(vv);
+}
+
+extern "C" void dcvc_k_yuv420_to_padded_fp16(const uint8_t* y, int y_stride,
+                                             const uint8_t* u, int u_stride,
+                                             const uint8_t* v, int v_stride,
+                                             int in_w, int in_h,
+                                             void* out, int pad_w, int pad_h,
+                                             cudaStream_t stream) {
+    dim3 block(32, 8);
+    dim3 grid((pad_w + block.x - 1) / block.x, (pad_h + block.y - 1) / block.y);
+    yuv420_to_padded_fp16_k<<<grid, block, 0, stream>>>(
+        y, y_stride, u, u_stride, v, v_stride, in_w, in_h,
+        (__half*)out, pad_w, pad_h);
+}
+
+// ===========================================================================
+// 24. fp16_to_yuv420_crop: padded YCbCr444 FP16 planar -> YUV420P 8-bit.
+//     Replaces dcvc_rt.c decode crop+convert: crop pad->original, Y = clamp*255+0.5,
+//     U/V = 2x2 box-average of cropped plane then *255+0.5.
+//     in: CHW padded [1,pad_h,pad_w]; out y[in_h,in_w] u/v[in_h/2,in_w/2].
+// ===========================================================================
+__global__ void fp16_to_yuv420_crop_k(const __half* __restrict__ in, int pad_w, int pad_h,
+                                      int in_w, int in_h,
+                                      uint8_t* __restrict__ y, int y_stride,
+                                      uint8_t* __restrict__ u, int u_stride,
+                                      uint8_t* __restrict__ v, int v_stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= in_w || j >= in_h) return;
+    int plane = pad_w * pad_h;
+    const __half* yp = in;
+    const __half* up = in + plane;
+    const __half* vp = in + 2 * plane;
+    int idx = j * pad_w + i;
+    float yv = __half2float(yp[idx]);
+    if (yv < 0.0f) yv = 0.0f; if (yv > 1.0f) yv = 1.0f;
+    y[j * y_stride + i] = (uint8_t)(yv * 255.0f + 0.5f);
+
+    // 2x2 box average only at UV-pixel anchors (even j, even i) to avoid races.
+    if ((j & 1) == 0 && (i & 1) == 0) {
+        int uh = in_h / 2, uw = in_w / 2;
+        int uj = j / 2, ui = i / 2;
+        if (uj < uh && ui < uw) {
+            float us = 0.0f, vs = 0.0f, cnt = 0.0f;
+            for (int dj = 0; dj < 2; dj++) for (int di = 0; di < 2; di++) {
+                int jj = j + dj, ii = i + di;
+                if (jj < in_h && ii < in_w) {
+                    int o = jj * pad_w + ii;
+                    us += __half2float(up[o]); vs += __half2float(vp[o]); cnt += 1.0f;
+                }
+            }
+            us = (us / cnt); if (us < 0.0f) us = 0.0f; if (us > 1.0f) us = 1.0f;
+            vs = (vs / cnt); if (vs < 0.0f) vs = 0.0f; if (vs > 1.0f) vs = 1.0f;
+            u[uj * u_stride + ui] = (uint8_t)(us * 255.0f + 0.5f);
+            v[uj * v_stride + ui] = (uint8_t)(vs * 255.0f + 0.5f);
+        }
+    }
+}
+
+extern "C" void dcvc_k_fp16_to_yuv420_crop(const void* in, int pad_w, int pad_h,
+                                           int in_w, int in_h,
+                                           uint8_t* y, int y_stride,
+                                           uint8_t* u, int u_stride,
+                                           uint8_t* v, int v_stride,
+                                           cudaStream_t stream) {
+    dim3 block(32, 8);
+    dim3 grid((in_w + block.x - 1) / block.x, (in_h + block.y - 1) / block.y);
+    fp16_to_yuv420_crop_k<<<grid, block, 0, stream>>>(
+        (const __half*)in, pad_w, pad_h, in_w, in_h, y, y_stride, u, u_stride, v, v_stride);
+}

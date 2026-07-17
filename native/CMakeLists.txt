@@ -69,6 +69,23 @@ if(DCVC_RT_HAS_CUDA)
   enable_language(CUDA)
   target_compile_definitions(dcvc_plugins PUBLIC DCVC_RT_HAS_CUDA)
   target_compile_definitions(dcvc_rt PUBLIC DCVC_RT_HAS_CUDA)
+
+  # Host-side CUDA kernels (libdcvc_kernels.so), loaded at runtime via dlopen
+  # by the encoder/decoder (dcvc_rt.c). Previously built by a hand-run nvcc
+  # command that cmake never tracked -> stale .so / silent dlsym failures.
+  # Now a first-class build target: `cmake --build build` rebuilds it.
+  add_library(dcvc_kernels SHARED plugins/src/dcvc_kernels.cu)
+  target_include_directories(dcvc_kernels PRIVATE ${DCVC_RT_INCLUDE})
+  set_target_properties(dcvc_kernels PROPERTIES
+    CUDA_ARCHITECTURES "80"
+    POSITION_INDEPENDENT_CODE ON)
+  if(NOT MSVC)
+    target_compile_options(dcvc_kernels PRIVATE -O2)
+  endif()
+  # Runtime loads it from <build>/plugin_demo/libdcvc_kernels.so
+  set_target_properties(dcvc_kernels PROPERTIES
+    OUTPUT_NAME "dcvc_kernels"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin_demo")
 endif()
 
 # Threads for rANS multi-thread
