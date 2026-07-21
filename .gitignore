@@ -16,6 +16,8 @@ venv/
 *.bin
 *.png
 *.tar
+*.npy
+*.npz
 
 # Shared libraries
 *.so
@@ -24,6 +26,8 @@ venv/
 
 # Build directories
 build/
+build-mingw/
+bench_out/
 build_msvc/
 cmake-build-*/
 out/
@@ -31,6 +35,7 @@ Debug/
 Release/
 x64/
 Win32/
+dist/
 
 # Native object / library / binary artifacts
 *.o
@@ -44,21 +49,28 @@ Win32/
 *.idb
 
 # Generated native assets (keep directory placeholders)
-native/assets/engines/*
-!native/assets/engines/.gitkeep
-native/assets/qp/*
-!native/assets/qp/.gitkeep
+tensorRT/assets/engines/*
+!tensorRT/assets/engines/.gitkeep
+tensorRT/assets/qp/*
+!tensorRT/assets/qp/.gitkeep
 
 # Model weights / checkpoints
 checkpoints/
 
 # Generated native asset pipelines
-native/assets/cdf/
-native/assets/decode/
-native/assets/golden/
-native/assets/onnx/
-native/assets/test_tensors/
-native/assets/*.json
+tensorRT/assets/cdf/
+tensorRT/assets/decode/
+tensorRT/assets/golden/
+tensorRT/assets/onnx/
+tensorRT/assets/test_tensors/
+tensorRT/assets/*.json
+
+# ONNX codec: generated models, CDF tables, and packaged output.
+# models/ is produced by onnx/python/export_all_models.py; dist/ by
+# the CMake `dcvc_package` target.
+onnx/models/
+onnx/dist/
+.ort-cache/
 
 # Logs and runtime artifacts
 *.log
@@ -67,3 +79,9 @@ native/assets/*.json
 *.trt
 *.pth
 *.pt
+
+# Backup / scratch files
+*.bak
+*.orig
+*.rej
+dcvc_frame.bin*
