@@ -1,5 +1,7 @@
-# DCVC CPU ONNX codec: a standalone, cross-platform (Linux/Windows), CPU-only
-# DCVC-RT I-frame codec built on ONNX Runtime + the native C rANS library.
+# DCVC CPU ONNX codec: a standalone, cross-platform (Linux/Windows) DCVC-RT
+# I-frame codec built on ONNX Runtime + the native C rANS library. CPU by
+# default; configure with -DDCVC_ORT_GPU=ON to fetch the CUDA-enabled ONNX
+# Runtime package and enable the CUDA/TensorRT execution providers.
 cmake_minimum_required(VERSION 3.18)
 project(dcvc_onnx C CXX)
 
@@ -27,14 +29,25 @@ include(FetchContent)
 # ===========================================================================
 # Fetch a prebuilt ONNX Runtime for the current platform (Linux/Windows x64).
 # ===========================================================================
-set(ORT_VERSION "1.19.0" CACHE STRING "ONNX Runtime version to fetch")
+set(ORT_VERSION "1.27.0" CACHE STRING "ONNX Runtime version to fetch")
+# ON: fetch the GPU package (CUDA + TensorRT providers; requires matching
+# CUDA/cuDNN, and TensorRT for the TensorRT EP, installed on the system).
+# OFF: fetch the CPU-only package.
+option(DCVC_ORT_GPU "Fetch the CUDA-enabled ONNX Runtime package" OFF)
+# When DCVC_ORT_GPU=ON, select the CUDA major version of the ORT package
+# (ORT 1.27+ splits GPU packages by CUDA version: gpu_cuda12 / gpu_cuda13).
+set(DCVC_ORT_CUDA_VERSION "12" CACHE STRING "CUDA major version for the GPU-enabled ORT package (12 or 13)")
 if(WIN32)
-    set(ORT_PACKAGE_NAME "onnxruntime-win-x64-${ORT_VERSION}")
+    set(_ORT_PLATFORM "win-x64")
     set(_ORT_EXT "zip")
 else()
-    set(ORT_PACKAGE_NAME "onnxruntime-linux-x64-${ORT_VERSION}")
+    set(_ORT_PLATFORM "linux-x64")
     set(_ORT_EXT "tgz")
 endif()
+if(DCVC_ORT_GPU)
+    set(_ORT_PLATFORM "${_ORT_PLATFORM}-gpu_cuda${DCVC_ORT_CUDA_VERSION}")
+endif()
+set(ORT_PACKAGE_NAME "onnxruntime-${_ORT_PLATFORM}-${ORT_VERSION}")
 
 # Where the ONNX Runtime archive is obtained from. Resolution order:
 #   1. DCVC_ORT_ARCHIVE  -> use a local archive file you already downloaded
@@ -86,7 +99,9 @@ if(WIN32)
     endif()
 else()
     set(ORT_IMPLIB "${ORT_LIB_DIR}/libonnxruntime.so")
-    file(GLOB ORT_RUNTIME_LIBS "${ORT_LIB_DIR}/libonnxruntime.so*")
+    # GPU packages also ship libonnxruntime_providers_{shared,cuda,tensorrt}.so,
+    # which ORT dlopens at EP append time; they must sit next to the binary.
+    file(GLOB ORT_RUNTIME_LIBS "${ORT_LIB_DIR}/libonnxruntime*.so*")
 endif()
 
 find_package(Threads REQUIRED)

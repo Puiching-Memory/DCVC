@@ -51,6 +51,51 @@ zH, zW = H // 64, W // 64  # z (hyper) latent resolution
 
 THRESH = 1e-4
 
+# Latest opset officially supported by the deployed ONNX Runtime 1.27
+# (opset 27 is still "under development" and rejected by ORT at load time).
+# The IR version is whatever the torch dynamo exporter emits natively.
+OPSET_VERSION = 26
+
+# Axes map with DISTINCT symbolic dim names per tensor kind: the dynamo
+# exporter bakes the value_info of every intermediate with the symbolic names
+# we give, and reusing the same name ('h'/'w') for tensors that differ in
+# resolution (feature-plane vs y-plane) makes ORT's shape inference collapse
+# them and fail buffer reuse checks. Keeping the names distinct matches what
+# the old dynamo=False exporter inferred.
+AXES_FEATURE = {2: 'h', 3: 'w'}          # H/8  plane
+AXES_LATENT = {2: 'h_latent', 3: 'w_latent'}  # H/16 plane
+
+
+def axes_for(name, spatial_names, feature_names):
+    if name not in spatial_names:
+        return None
+    return AXES_FEATURE if name in feature_names else AXES_LATENT
+
+
+def export_module(path, module, args, input_names, output_names, spatial_names,
+                  feature_names):
+    """Export one wrapper/module to ONNX with dynamic spatial axes (dims 2,3).
+
+    Only names in `spatial_names` (the feature/latent tensors) get dynamic
+    axes; the q-vectors (1x1) stay fixed. `feature_names` selects which of
+    the spatial tensors live on the H/8 feature plane (the rest are on the
+    H/16 y plane).
+
+    Uses the dynamo exporter at the latest opset supported by ORT 1.27.
+    """
+    dynamic_axes = {}
+    for n in input_names + output_names:
+        ax = axes_for(n, spatial_names, feature_names)
+        if ax is not None:
+            dynamic_axes[n] = ax
+    torch.onnx.export(
+        module, args, path,
+        input_names=input_names, output_names=output_names,
+        dynamic_axes=dynamic_axes, opset_version=OPSET_VERSION, dynamo=True,
+        external_data=False,  # keep each model a single self-contained file
+    )
+    print('exported', os.path.relpath(path, ROOT))
+
 
 # ---------------------------------------------------------------------------
 # Small wrappers so the exported ONNX graphs have clean named I/O and exclude
@@ -104,22 +149,6 @@ class RGWrap(nn.Module):
 # ---------------------------------------------------------------------------
 # Export helper.
 # ---------------------------------------------------------------------------
-def export_module(path, module, args, input_names, output_names, spatial_names):
-    """Export one wrapper/module to ONNX with dynamic spatial axes (dims 2,3).
-
-    Only names in `spatial_names` (the feature/latent tensors) get dynamic axes;
-    the q-vectors (1x1) stay fixed so batch/channel/spatial are all static.
-    """
-    dynamic_axes = {n: {2: 'h', 3: 'w'} for n in set(spatial_names)}
-    torch.onnx.export(
-        module, args, path,
-        input_names=input_names, output_names=output_names,
-        dynamic_axes=dynamic_axes, opset_version=17, dynamo=False,
-    )
-    print('exported', os.path.relpath(path, ROOT))
-
-
-# ---------------------------------------------------------------------------
 # Model specifications: name, wrapper, input specs, output names, spatial names.
 # Each input spec is (name, (C, h, w), kind) where kind in {feat, frame, q}.
 # ---------------------------------------------------------------------------
@@ -131,20 +160,20 @@ def build_specs(net):
     specs.append(dict(
         name="inter_feature_adaptor_i", module=net.feature_adaptor_i,
         inputs=[("in0", (g_ch_src_d, fH, fW), "frame")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=["in0", "out0"]))
 
     # 2. feature_adaptor_p: Conv2d(256 -> 256)
     specs.append(dict(
         name="inter_feature_adaptor_p", module=net.feature_adaptor_p,
         inputs=[("in0", (g_ch_d, fH, fW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=["in0", "out0"]))
 
     # 3. feature_extractor: returns ctx, ctx_t (TWO outputs)
     specs.append(dict(
         name="inter_feature_extractor", module=FEWrap(net.feature_extractor),
         inputs=[("in0", (g_ch_d, fH, fW), "feat"), ("q_feat", (g_ch_d, 1, 1), "q")],
         outputs=["ctx", "ctx_t"],
-        spatial=["in0", "ctx", "ctx_t"]))
+        spatial=["in0", "ctx", "ctx_t"], feature=["in0", "ctx", "ctx_t"]))
 
     # 4. inter_encoder: already-unshuffled x + ctx + q_enc -> y latent
     specs.append(dict(
@@ -152,37 +181,38 @@ def build_specs(net):
         inputs=[("in0", (g_ch_src_d, fH, fW), "frame"),
                 ("ctx", (g_ch_d, fH, fW), "feat"),
                 ("q_enc", (g_ch_d, 1, 1), "q")],
-        outputs=["out0"], spatial=["in0", "ctx", "out0"]))
+        outputs=["out0"], spatial=["in0", "ctx", "out0"],
+        feature=["in0", "ctx"]))
 
     # 5. hyper_encoder: y -> z
     specs.append(dict(
         name="inter_hyper_enc", module=net.hyper_encoder,
         inputs=[("in0", (g_ch_y, yH, yW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=[]))
 
     # 6. hyper_decoder: z -> y
     specs.append(dict(
         name="inter_hyper_dec", module=net.hyper_decoder,
         inputs=[("in0", (g_ch_z, zH, zW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=[]))
 
     # 7. temporal_prior_encoder: ResidualBlockWithStride2(256 -> 256) fH -> yH
     specs.append(dict(
         name="inter_temporal_prior", module=net.temporal_prior_encoder,
         inputs=[("in0", (g_ch_d, fH, fW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=["in0"]))
 
     # 8. y_prior_fusion: cat(hier[128], temporal[256]) = 384 -> 384
     specs.append(dict(
         name="inter_prior_fusion", module=net.y_prior_fusion,
         inputs=[("in0", (g_ch_y * 3, yH, yW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=[]))
 
     # 9. y_spatial_prior: cat(y_hat[128], params[384]) = 512 -> 256
     specs.append(dict(
         name="inter_spatial_prior", module=net.y_spatial_prior,
         inputs=[("in0", (g_ch_y * 4, yH, yW), "feat")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=[]))
 
     # 10. inter_decoder: y_hat + ctx + q_dec -> feature (fH)
     specs.append(dict(
@@ -190,14 +220,15 @@ def build_specs(net):
         inputs=[("in0", (g_ch_y, yH, yW), "feat"),
                 ("ctx", (g_ch_d, fH, fW), "feat"),
                 ("q_dec", (g_ch_d, 1, 1), "q")],
-        outputs=["out0"], spatial=["in0", "ctx", "out0"]))
+        outputs=["out0"], spatial=["in0", "ctx", "out0"],
+        feature=["ctx", "out0"]))
 
     # 11. recon_generation: feature + q_recon -> src_d (NO pixel_shuffle/clamp)
     specs.append(dict(
         name="recon_generation", module=RGWrap(net.recon_generation_net),
         inputs=[("in0", (g_ch_d, fH, fW), "feat"),
                 ("q_recon", (g_ch_recon, 1, 1), "q")],
-        outputs=["out0"], spatial=["in0", "out0"]))
+        outputs=["out0"], spatial=["in0", "out0"], feature=["in0", "out0"]))
 
     return specs
 
@@ -272,7 +303,7 @@ def main():
                             for (_, shape, _) in spec["inputs"])
         export_module(path, spec["module"], example,
                       [n for (n, _, _) in spec["inputs"]],
-                      spec["outputs"], spec["spatial"])
+                      spec["outputs"], spec["spatial"], spec["feature"])
 
     # ---- Export 4 q-bank .npy files ----
     qbanks = [

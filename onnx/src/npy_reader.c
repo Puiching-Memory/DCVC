@@ -148,6 +148,69 @@ int dcvc_npy_read(const char* path, DcvcNpy* o)
     return 0;
 }
 
+/* Open the file and parse the header; return the file pointer positioned at
+ * the beginning of the data payload. On success leaves metadata in the
+ * supplied buffers and returns 0. */
+static int open_npy_data(const char* path, FILE** out_f, int* out_ndims, int* out_dims,
+                         int max_nd, DcvcNpyDtype* out_dtype)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[6];
+    if (fread(magic, 1, 6, f) != 6 || memcmp(magic, "\x93NUMPY", 6) != 0) { fclose(f); return -1; }
+    uint8_t major = 0, minor = 0;
+    if (fread(&major, 1, 1, f) != 1 || fread(&minor, 1, 1, f) != 1) { fclose(f); return -1; }
+    size_t header_len = 0;
+    if (major == 1) {
+        uint16_t h16 = 0;
+        if (fread(&h16, 2, 1, f) != 1) { fclose(f); return -1; }
+        header_len = h16;
+    } else if (major >= 2) {
+        uint32_t h32 = 0;
+        if (fread(&h32, 4, 1, f) != 1) { fclose(f); return -1; }
+        header_len = h32;
+    } else { fclose(f); return -1; }
+    char hdr[1024];
+    if (header_len >= sizeof(hdr) || fread(hdr, 1, header_len, f) != header_len) { fclose(f); return -1; }
+    hdr[header_len] = '\0';
+    if (parse_header(hdr, out_ndims, out_dims, max_nd, out_dtype) != 0) { fclose(f); return -1; }
+    *out_f = f;
+    return 0;
+}
+
+int dcvc_npy_read_meta(const char* path, int* out_ndims, int* out_dims, int max_nd)
+{
+    FILE* f = NULL;
+    DcvcNpyDtype dtype;
+    if (open_npy_data(path, &f, out_ndims, out_dims, max_nd, &dtype) != 0) return -1;
+    fclose(f);
+    return 0;
+}
+
+int dcvc_npy_read_frame_f32(const char* path, int frame_idx, float* out_data,
+                              int* out_dims /* 3 entries: C, H, W */)
+{
+    FILE* f = NULL;
+    int ndims = 0;
+    int dims[8] = {0};
+    DcvcNpyDtype dtype;
+    if (open_npy_data(path, &f, &ndims, dims, 8, &dtype) != 0) return -1;
+    if (dtype != DCVC_NPY_F32 || ndims < 4) { fclose(f); return -1; }
+    if (frame_idx < 0 || frame_idx >= dims[0]) { fclose(f); return -1; }
+    size_t c = (size_t)dims[ndims - 3];
+    size_t h = (size_t)dims[ndims - 2];
+    size_t w = (size_t)dims[ndims - 1];
+    size_t frame_floats = c * h * w;
+    size_t offset = (size_t)frame_idx * frame_floats * sizeof(float);
+    if (fseek(f, (long)offset, SEEK_CUR) != 0) { fclose(f); return -1; }
+    if (fread(out_data, sizeof(float), frame_floats, f) != frame_floats) { fclose(f); return -1; }
+    fclose(f);
+    out_dims[0] = (int)c;
+    out_dims[1] = (int)h;
+    out_dims[2] = (int)w;
+    return 0;
+}
+
 void dcvc_npy_free(DcvcNpy* o)
 {
     if (!o) return;

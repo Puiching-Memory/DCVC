@@ -1,12 +1,12 @@
 # DCVC CPU ONNX codec (cross-platform, TensorRT-free I-frame + P-frame codec)
 
-A standalone, **Linux + Windows**, CPU-only end-to-end DCVC-RT I-frame + P-frame
-(intra + inter) codec.
-It avoids the original TensorRT/CUDA path and the custom-op route by decomposing the
-fused `DcvcDepthConv` blocks into standard ONNX operators, then running every
-neural network with the **ONNX Runtime CPU execution provider**. Entropy coding
-uses the same C rANS library as the native runtime, so the pipeline is fully
-independent of TensorRT.
+A standalone, **Linux + Windows** end-to-end DCVC-RT I-frame + P-frame
+(intra + inter) codec. CPU by default, with optional CUDA/TensorRT acceleration.
+Every neural subnet is exported from PyTorch as standard ONNX operators (no
+custom CUDA ops) and runs under **ONNX Runtime** (CPU execution provider by
+default; the CUDA or TensorRT EP can be enabled at runtime, see "GPU execution"
+below). Entropy coding uses the same C rANS library as the native runtime, so the
+pipeline is fully independent of TensorRT.
 
 ## Directory layout
 
@@ -15,18 +15,18 @@ onnx/
 ├── CMakeLists.txt      # modular build: auto-fetches ONNX Runtime, builds 3 exes, `dcvc_package` target
 ├── src/                # codec sources (engine, AR codec, intra+inter pipelines, npy reader)
 ├── tests/              # test executables
-├── python/             # model export / standard-op conversion / tolerance sweep
+├── python/             # model export / PTQ / tolerance sweep
 ├── scripts/            # build_linux.sh, build_windows.ps1
 └── models/             # runtime *.onnx models + *.npy CDF tables (generated)
 ```
 
 ## Why standard ops instead of custom ops?
 
-The exported `intra_analysis.onnx` uses a proprietary `DcvcDepthConv` custom op.
-Implementing a CPU custom op for ONNX Runtime adds complexity and a fragile C API
-registration path. Since the block is just a composition of `Conv`, `Sigmoid`,
-`Mul`, `Add`, and `Slice`, we convert it to standard ONNX operators and let the
-CPU EP execute everything in FP32.
+The TensorRT path fuses each `DepthConvBlock` into a proprietary `DcvcDepthConv`
+custom op. The CPU pipeline instead exports every subnet (including
+`IntraEncoder`) via torch dynamo from the pure-PyTorch `forward_torch` path —
+`Conv` / `Sigmoid` / `Mul` / `Add` / `Split` — so the ORT CPU EP runs everything
+in FP32 with no custom-op registration.
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ CPU EP execute everything in FP32.
 - CMake ≥ 3.18
 - A C++17 compiler: GCC/Clang on Linux, or Visual Studio 2019/2022 with the
   "Desktop development with C++" workload on Windows.
-- ONNX Runtime is **downloaded automatically** during configure (1.19.0, x64).
+- ONNX Runtime is **downloaded automatically** during configure (1.27.0, x64).
   If the direct GitHub download is slow, point the build at a mirror or a
   pre-downloaded archive with these CMake variables:
   - `-DDCVC_ORT_ARCHIVE=/path/to/onnxruntime-*.zip` — use a local file (fastest)
@@ -68,6 +68,44 @@ Binaries are placed directly under `build/` (Linux) or `build/Release/`
 (Windows). The ONNX Runtime shared library is copied next to them automatically,
 and on Linux an `$ORIGIN` RPATH is set so they run without `LD_LIBRARY_PATH`.
 
+### GPU execution (optional)
+
+By default everything runs on the ONNX Runtime CPU execution provider. To
+enable the CUDA or TensorRT execution provider:
+
+```bash
+# 1. Build against the GPU-enabled ONNX Runtime package (fetches
+#    onnxruntime-*-gpu_cuda12-1.27.0 instead of the CPU one). The system must
+#    have matching CUDA + cuDNN installed (plus TensorRT for the TensorRT EP);
+#    see the ONNX Runtime 1.27 release notes for exact versions.
+#    For CUDA 13, add -DDCVC_ORT_CUDA_VERSION=13.
+cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release -DDCVC_ORT_GPU=ON
+cmake --build build-gpu -j$(nproc)
+
+# 2. Select the execution provider at runtime:
+DCVC_USE_GPU=1 ./build-gpu/test_cpu_end2end   # CUDA EP
+DCVC_USE_GPU=2 ./build-gpu/test_cpu_end2end   # TensorRT EP
+DCVC_USE_GPU=0 ./build-gpu/test_cpu_end2end   # CPU (default)
+DCVC_GPU_DEVICE=1 DCVC_USE_GPU=1 ./build-gpu/test_cpu_end2end  # second GPU
+```
+
+If the requested provider is not compiled into the fetched ONNX Runtime (e.g.
+`DCVC_USE_GPU=1` with the default CPU package) the engine prints a warning and
+falls back to CPU. C API users can pass the same `0/1/2` values as the
+`use_gpu` argument of `dcvc_cpu_engine_create()`, which takes precedence over
+`DCVC_USE_GPU`.
+
+Note: entropy coding (rANS) and all tensor buffers stay on the CPU; ONNX
+Runtime inserts the device copies automatically. The codec runs many small
+sessions per frame, so PCIe transfer overhead can eat the GPU speedup —
+measure against the CPU build before committing to it.
+
+Cross-device caution: mixing execution providers between encoder and decoder
+(e.g. CPU encode, GPU decode) can desync the rANS entropy coder via ULP-level
+FP differences in the entropy-parameter networks. See
+[docs/entropy_sync_ptq_report.md](docs/entropy_sync_ptq_report.md) for the
+full analysis and the INT8/INT16 quantization experiments.
+
 ### Cross-compile Windows from Linux (MinGW-w64)
 
 You can produce Windows x64 binaries without a Windows machine, using MinGW-w64:
@@ -78,7 +116,7 @@ sudo apt-get install mingw-w64
 # 2a. Fastest path: pre-download the Windows ORT package via a mirror, then point
 #     the build at the local archive (avoids slow direct GitHub downloads):
 curl -L -o ort.zip \
-  https://gh-proxy.com/https://github.com/microsoft/onnxruntime/releases/download/v1.19.0/onnxruntime-win-x64-1.19.0.zip
+  https://gh-proxy.com/https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip
 DCVC_ORT_ARCHIVE=ort.zip bash onnx/scripts/build_windows_cross.sh
 
 # 2b. Or let the build fetch the Windows ORT package through a mirror:
@@ -152,11 +190,9 @@ padded frame, then crops the reconstruction back to the original size. The
 bitstream stores the original `H,W` so the decoder reconstructs exactly the
 requested resolution.
 
-`intra_analysis_standard.onnx` is the only model whose original export baked in a
-fixed pixel-unshuffle shape. `python/make_intra_analysis_dynamic.py` rewrites
-those two static Reshape constants with a shape-computing subgraph (every Conv
-weight is untouched), so the model runs at any spatial size. `export_all_models.py`
-runs this patch automatically.
+All exported models use dynamo `dynamic_shapes` so spatial dims are symbolic;
+`intra_analysis_standard.onnx` accepts any `H,W` (multiple of 8 for the
+pixel-unshuffle, and the full pipeline pads to a multiple of 64).
 
 Verified bit-exact round-trips include 64x64, 100x100, 192x256, 200x200,
 270x180, 300x200, 320x192 and 512x512 for I-frames, and 128x128 ... 512x512 for
@@ -189,12 +225,11 @@ uv run python python/export_all_models.py
 # Custom locations (defaults are relative to the repo root, never hardcoded):
 #   --out-dir <dir>          default: <repo>/onnx/models
 #   --checkpoint <pth>       default: <repo>/checkpoints/cvpr2025_image.pth.tar
-#   --original-intra-analysis default: <repo>/tensorRT/assets/onnx/intra_analysis.onnx
 ```
 
-This writes `intra_analysis_standard.onnx` (via `convert_to_standard_ops.py`),
-the remaining standard-op networks, the QP scales, and copies the entropy CDF
-tables into `models/`.
+This dynamo-exports all 9 intra nets from `DMCI` (including
+`intra_analysis_standard.onnx` from `model.enc`), writes the QP scales, and
+copies the entropy CDF tables into `models/`.
 
 ## Runtime model files (`models/`)
 
@@ -273,9 +308,10 @@ DCVC_DUMP_Y=y.npy DCVC_DUMP_PARAMS=params_fusion.npy \
 
 ## Model details
 
-`DepthConvBlock` expands to `dc3(ws_relu(dc2(ws_relu(dc0(x))))) + x` followed by
+`DepthConvBlock.forward_torch` expands to
+`dc3(ws_relu(dc2(ws_relu(dc0(x))))) + x` followed by
 `ffn2(ws_relu_chunk_add(ffn0(dc)))`, where
-`ws_relu(x) = x * sigmoid(4*x)` and `ws_relu_chunk_add(x) = ws_relu(x[:,:2C]) + ws_relu(x[:,2C:])`.
-`convert_to_standard_ops.py` replaces every `DcvcDepthConv` node with this exact
-subgraph using ONNX `Conv`, `Sigmoid`, `Mul`, `Add`, and `Slice`, so the result
-runs on the CPU EP with no custom code.
+`ws_relu(x) = x * sigmoid(4*x)` and
+`ws_relu_chunk_add(x) = ws_relu(x[:,:2C]) + ws_relu(x[:,2C:])`. Torch dynamo
+exports that subgraph as ONNX `Conv` / `Sigmoid` / `Mul` / `Add` / `Split`, so
+the result runs on the CPU EP with no custom code.

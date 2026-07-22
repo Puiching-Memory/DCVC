@@ -26,6 +26,12 @@ typedef struct DcvcCpuTensorView {
 
 typedef struct DcvcCpuEngine DcvcCpuEngine;
 
+/* use_gpu selects the ONNX Runtime execution provider:
+ *   0 = CPU (default; the DCVC_USE_GPU environment variable may override),
+ *   1 = CUDA EP, 2 = TensorRT EP.
+ * A GPU EP requires an ORT build that ships it (configure with -DDCVC_ORT_GPU=ON);
+ * if the requested EP is unavailable the engine falls back to CPU with a warning.
+ * DCVC_GPU_DEVICE selects the GPU device index (default 0). */
 DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCpuStatus* out_st);
 void dcvc_cpu_engine_destroy(DcvcCpuEngine* eng);
 

@@ -10,6 +10,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+static void dcvc_setenv_default(const char* key, const char* val) {
+    if (getenv(key)) return;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s=%s", key, val);
+    _putenv(buf);
+}
+#else
+static void dcvc_setenv_default(const char* key, const char* val) {
+    if (getenv(key)) return;
+    setenv(key, val, 0);
+}
+#endif
+
 static int load_f32(const char* path, float** out, int dims[4]) {
     DcvcNpy n; if (dcvc_npy_read(path,&n)!=0) return -1;
     if (n.dtype!=DCVC_NPY_F32){dcvc_npy_free(&n);return -1;}
@@ -23,9 +38,9 @@ int main(int argc,char**argv){
     int qp=argc>3?atoi(argv[3]):32;
     const char* model_dir=argc>4?argv[4]:"../models";
     const char* out_bin=argc>5?argv[5]:NULL;
-    if (!getenv("DCVC_DUMP_YHAT")) setenv("DCVC_DUMP_YHAT","/tmp/cpp_yhat.npy",0);
-    if (!getenv("DCVC_DUMP_XHAT")) setenv("DCVC_DUMP_XHAT","/tmp/cpp_xhat.npy",0);
-    if (!getenv("DCVC_DUMP_FEAT")) setenv("DCVC_DUMP_FEAT","/tmp/cpp_feat.npy",0);
+    if (!getenv("DCVC_DUMP_YHAT")) dcvc_setenv_default("DCVC_DUMP_YHAT","/tmp/cpp_yhat.npy");
+    if (!getenv("DCVC_DUMP_XHAT")) dcvc_setenv_default("DCVC_DUMP_XHAT","/tmp/cpp_xhat.npy");
+    if (!getenv("DCVC_DUMP_FEAT")) dcvc_setenv_default("DCVC_DUMP_FEAT","/tmp/cpp_feat.npy");
     float*ref=NULL;float*x=NULL;int rd[4],xd[4];
     if(load_f32(argv[1],&ref,rd)||load_f32(argv[2],&x,xd)){fprintf(stderr,"npy read fail\n");return 1;}
     int H=rd[2],W=rd[3];

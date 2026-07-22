@@ -66,10 +66,17 @@ tensorRT/assets/test_tensors/
 tensorRT/assets/*.json
 
 # ONNX codec: generated models, CDF tables, and packaged output.
-# models/ is produced by onnx/python/export_all_models.py; dist/ by
-# the CMake `dcvc_package` target.
+# models/ is produced by onnx/python/export_all_models.py (+ export_inter_models.py);
+# dist/ by the CMake `dcvc_package` target.
 onnx/models/
+onnx/models_*/
 onnx/dist/
+onnx/build*/
+onnx/python/calib_data/
+onnx/python/auto_search_results/
+onnx/python/.hist_cache/
+onnx/python/rd_*/
+onnx/python/ablation_results.json
 .ort-cache/
 
 # Logs and runtime artifacts

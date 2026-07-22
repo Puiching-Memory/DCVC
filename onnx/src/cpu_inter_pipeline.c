@@ -21,9 +21,16 @@ static void inter_dump(const char* env, const float* d, int c, int h, int w)
 {
     const char* path = getenv(env);
     if (!path || !path[0]) return;
+    char frame_path[1024];
+    const char* frame_idx = getenv("DCVC_DUMP_FRAME");
+    if (frame_idx && frame_idx[0]) {
+        snprintf(frame_path, sizeof(frame_path), "%s_f%s.npy", path, frame_idx);
+    } else {
+        snprintf(frame_path, sizeof(frame_path), "%s.npy", path);
+    }
     int dims[4] = {1, c, h, w};
-    if (dcvc_npy_write_f32(path, d, dims, 4) == 0)
-        fprintf(stderr, "[inter] dumped %s [%dx%dx%d] to %s\n", env, c, h, w, path);
+    if (dcvc_npy_write_f32(frame_path, d, dims, 4) == 0)
+        fprintf(stderr, "[inter] dumped %s [%dx%dx%d] to %s\n", env, c, h, w, frame_path);
 }
 
 /* Channel constants (src/models/video_model.py) */
@@ -317,6 +324,10 @@ DcvcCpuInterPipeline* dcvc_cpu_inter_pipeline_create(const char* model_dir,
     if (!model_dir || H <= 0 || W <= 0) {
         if (out_st) *out_st = DCVC_CPU_ERR_INVALID_ARG; return NULL;
     }
+    if (H % 64 != 0 || W % 64 != 0) {
+        fprintf(stderr, "error: inter pipeline requires H and W to be multiples of 64 (got %dx%d)\n", H, W);
+        if (out_st) *out_st = DCVC_CPU_ERR_INVALID_ARG; return NULL;
+    }
     DcvcCpuInterPipeline* p = (DcvcCpuInterPipeline*)calloc(1, sizeof(*p));
     if (!p) { if (out_st) *out_st = DCVC_CPU_ERR_OOM; return NULL; }
     p->H = H; p->W = W; p->qp = qp;
@@ -493,6 +504,7 @@ static DcvcCpuStatus prior_2x_decode(DcvcCpuInterPipeline* p)
     }
     /* y_hat = yhat_acc * q_dec */
     for (int i = 0; i < YCH * yHW; i++) p->y[i] = p->yhat_acc[i] * p->q_dec_v[i];
+    inter_dump("DCVC_DUMP_YHAT", p->y, YCH, p->yH, p->yW);
     return DCVC_CPU_OK;
 }
 

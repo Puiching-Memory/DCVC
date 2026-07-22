@@ -15,7 +15,7 @@
 #   DCVC_ORT_ARCHIVE   - use a local .zip you already downloaded (fastest)
 #                        e.g. fetched via a mirror:
 #   curl -L -o ort.zip \
-#     https://gh-proxy.com/https://github.com/microsoft/onnxruntime/releases/download/v1.19.0/onnxruntime-win-x64-1.19.0.zip
+#     https://gh-proxy.com/https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip
 #   DCVC_ORT_ARCHIVE=ort.zip bash onnx/scripts/build_windows_cross.sh
 #
 #   DCVC_ORT_URL_BASE  - mirror host prefix (github.com path is appended)

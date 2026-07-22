@@ -180,6 +180,11 @@ DcvcCpuIntraPipeline* dcvc_cpu_intra_pipeline_create(const char* model_dir,
         if (out_st) *out_st = DCVC_CPU_ERR_INVALID_ARG;
         return NULL;
     }
+    if (H % 64 != 0 || W % 64 != 0) {
+        fprintf(stderr, "error: intra pipeline requires H and W to be multiples of 64 (got %dx%d)\n", H, W);
+        if (out_st) *out_st = DCVC_CPU_ERR_INVALID_ARG;
+        return NULL;
+    }
 
     DcvcCpuIntraPipeline* p = (DcvcCpuIntraPipeline*)calloc(1, sizeof(*p));
     if (!p) { if (out_st) *out_st = DCVC_CPU_ERR_OOM; return NULL; }

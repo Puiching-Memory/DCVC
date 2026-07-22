@@ -79,10 +79,77 @@ static void check_status(const OrtApi* api, OrtStatus* st, DcvcCpuStatus* out_st
     }
 }
 
+/* Resolve the requested execution provider: an explicit use_gpu != 0 wins,
+ * otherwise the DCVC_USE_GPU environment variable (0/1/2) is consulted. */
+static int dcvc_requested_ep(int use_gpu)
+{
+    if (use_gpu != 0) return use_gpu;
+    const char* env = getenv("DCVC_USE_GPU");
+    return (env && env[0]) ? atoi(env) : 0;
+}
+
+static const char* dcvc_ep_name(int ep)
+{
+    return ep == 2 ? "TensorrtExecutionProvider" : "CUDAExecutionProvider";
+}
+
+/* Try to append the requested GPU EP to the session options.
+ * Returns 1 when the EP was appended, 0 when it is unavailable and the
+ * caller should continue with the default CPU EP. */
+static int dcvc_try_append_gpu_ep(const OrtApi* api, OrtSessionOptions* opts, int ep)
+{
+    OrtStatus* st = nullptr;
+
+    /* Check the provider is actually compiled into this ORT build. */
+    char** avail = nullptr;
+    int n_avail = 0;
+    st = api->GetAvailableProviders(&avail, &n_avail);
+    if (st) { api->ReleaseStatus(st); return 0; }
+    int found = 0;
+    for (int i = 0; i < n_avail; i++)
+        if (avail[i] && strcmp(avail[i], dcvc_ep_name(ep)) == 0) found = 1;
+    OrtStatus* rst = api->ReleaseAvailableProviders(avail, n_avail);
+    if (rst) api->ReleaseStatus(rst);
+    if (!found) return 0;
+
+    const char* dev = getenv("DCVC_GPU_DEVICE");
+    const char* keys[] = { "device_id" };
+    const char* vals[] = { (dev && dev[0]) ? dev : "0" };
+
+    if (ep == 2) {
+        OrtTensorRTProviderOptionsV2* trt = nullptr;
+        st = api->CreateTensorRTProviderOptions(&trt);
+        if (!st) st = api->UpdateTensorRTProviderOptions(trt, keys, vals, 1);
+        if (!st) st = api->SessionOptionsAppendExecutionProvider_TensorRT_V2(opts, trt);
+        if (trt) api->ReleaseTensorRTProviderOptions(trt);
+    } else {
+        OrtCUDAProviderOptionsV2* cuda = nullptr;
+        st = api->CreateCUDAProviderOptions(&cuda);
+        if (!st) st = api->UpdateCUDAProviderOptions(cuda, keys, vals, 1);
+        if (!st) st = api->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cuda);
+        if (cuda) api->ReleaseCUDAProviderOptions(cuda);
+    }
+    if (st) { api->ReleaseStatus(st); return 0; }
+    return 1;
+}
+
+/* Log the EP selection outcome once per process (a pipeline creates many
+ * engines; per-engine messages would drown the output). */
+static void dcvc_log_ep_once(int ep, int appended)
+{
+    static int logged = 0;
+    if (logged) return;
+    logged = 1;
+    if (appended)
+        fprintf(stderr, "dcvc_onnx: using %s\n", dcvc_ep_name(ep));
+    else
+        fprintf(stderr, "dcvc_onnx: %s unavailable in this ONNX Runtime build; using CPU\n",
+                dcvc_ep_name(ep));
+}
+
 DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCpuStatus* out_st)
 {
     if (out_st) *out_st = DCVC_CPU_OK;
-    (void)use_gpu; /* CPU backend for now; GPU EP optional later */
 
     OrtApi* api = (OrtApi*)OrtGetApiBase()->GetApi(ORT_API_VERSION);
     if (!api) { if (out_st) *out_st = DCVC_CPU_ERR_ONNX; return nullptr; }
@@ -107,6 +174,9 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     st = api->SetInterOpNumThreads(eng->opts, 1);
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
+
+    int ep = dcvc_requested_ep(use_gpu);
+    if (ep != 0) dcvc_log_ep_once(ep, dcvc_try_append_gpu_ep(api, eng->opts, ep));
 
 #ifdef _WIN32
     auto _wpath = dcvc_to_wide(onnx_path);
@@ -174,8 +244,9 @@ DcvcCpuStatus dcvc_cpu_engine_run(DcvcCpuEngine* eng,
         st = api->SessionGetInputTypeInfo(eng->session, i, &type_info);
         if (st) { check_status(api, st, nullptr); goto cleanup; }
         const OrtTensorTypeAndShapeInfo* info = nullptr;
-        (void)api->CastTypeInfoToTensorInfo(type_info, &info);
-        (void)info;
+        st = api->CastTypeInfoToTensorInfo(type_info, &info);
+        if (st) { check_status(api, st, nullptr); goto cleanup; }
+        (void)info;  /* validated above; shape is provided by caller */
         api->ReleaseTypeInfo(type_info);
 
         st = api->SessionGetInputName(eng->session, i, allocator, (char**)&in_names[i]);

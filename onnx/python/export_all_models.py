@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Export all ONNX models and auxiliary data needed for the pure-CPU pipeline."""
+"""Export all ONNX models and auxiliary data needed for the pure-CPU pipeline.
+
+All 9 intra nets (including intra_analysis_standard) are exported directly from
+DMCI submodules via torch dynamo. DepthConvBlock uses its pure-PyTorch path on
+CPU, so no custom-op ONNX or hand conversion is required.
+"""
 import argparse
 import os
 import shutil
 import sys
 import types
+
+# Silence the "customized cuda kernel is not used" warning and pick the torch path.
+os.environ.setdefault("SUPPRESS_CUSTOM_KERNEL_WARNING", "1")
 
 # Make src/ importable
 # Repo root (DCVC/). This script lives in <root>/onnx/python/.
@@ -25,25 +33,43 @@ utils = types.ModuleType('utils')
 utils.__path__ = [os.path.join(ROOT, 'src', 'utils')]
 sys.modules['src.utils'] = utils
 
-from src.models.image_model import DMCI
-from src.layers.cuda_inference import round_and_to_int8
+from src.models.image_model import DMCI, g_ch_enc_dec
 import torch
 import numpy as np
-
-from convert_to_standard_ops import convert_dcvc_depthconv_to_standard_ops
-from make_intra_analysis_dynamic import patch_model as make_intra_analysis_dynamic
 
 N = 256
 ZC = 128
 
+# Latest opset officially supported by the deployed ONNX Runtime 1.27
+# (opset 27 is still "under development" and rejected by ORT at load time).
+# The IR version is whatever the torch dynamo exporter / the source model
+# carries natively; we do not re-stamp it.
+OPSET_VERSION = 26
+
 
 def export_torch(net, args, path, in_names, out_name):
-    dynamic = {n: {0: 'batch', 2: 'h', 3: 'w'} for n in in_names}
-    dynamic[out_name] = {0: 'batch', 2: 'h', 3: 'w'}
+    """Export with dynamic H/W via the dynamo exporter's dynamic_shapes API.
+
+    dynamic_axes is legacy-only under dynamo=True and its derived-dim
+    constraints (e.g. pixel_shuffle 16x in intra_synthesis) conflict; Dim
+    objects avoid that. Outputs reuse the same Dim symbols, so the exporter
+    derives the output size symbolically from the input.
+    """
+    h = torch.export.Dim('h', min=4)
+    w = torch.export.Dim('w', min=4)
+    # Only dims 2/3 of the FIRST 4D input are symbolic; trailing q-vectors
+    # (1x1 broadcast) are left fully static, otherwise torch.export derives a
+    # bogus constraint q.size(2)==x.size(2) from the broadcast mul. min=4 keeps
+    # the Dim symbolic even for the tiny z-plane (4x4 at 256x256).
+    if not isinstance(args, (tuple, list)):
+        args = (args,)
+    dynamic_shapes = tuple({2: h, 3: w} if i == 0 else None
+                           for i, a in enumerate(args) if a.dim() == 4)
     torch.onnx.export(
         net, args, path,
         input_names=in_names, output_names=[out_name],
-        dynamic_axes=dynamic, opset_version=17, dynamo=False
+        dynamic_shapes=dynamic_shapes, opset_version=OPSET_VERSION, dynamo=True,
+        external_data=False,  # keep each model a single self-contained file
     )
     print('exported', path)
 
@@ -52,7 +78,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out-dir', default=os.path.join(ROOT, 'onnx', 'models'))
     parser.add_argument('--checkpoint', default=os.path.join(ROOT, 'checkpoints', 'cvpr2025_image.pth.tar'))
-    parser.add_argument('--original-intra-analysis', default=os.path.join(ROOT, 'native', 'assets', 'onnx', 'intra_analysis.onnx'))
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -67,17 +92,11 @@ def main():
     model.load_state_dict(sd)
     model.eval()
 
-    # 1. intra_analysis_standard.onnx (from original custom-op ONNX + FP32 weights)
-    standard_path = os.path.join(out_dir, 'intra_analysis_standard.onnx')
-    convert_dcvc_depthconv_to_standard_ops(args.original_intra_analysis, standard_path, args.checkpoint)
-    # intra_analysis_standard.onnx ships as a dynamic-resolution model (any H,W
-    # multiple of 8): rewrite the static pixel_unshuffle Reshape constants
-    # so input 'in0' is [1,3,'h','w']. Conv weights are untouched.
-    make_intra_analysis_dynamic(standard_path, standard_path)
-    print('made dynamic:', standard_path)
-
-    # 2. Other standard-op models, exported from PyTorch on CPU (DepthConvBlock uses torch path)
+    # All 9 intra nets: dynamo export from DMCI submodules (DepthConvBlock torch path).
+    # intra_analysis = IntraEncoder(x, quant_step): pixel_unshuffle(8) + DepthConv stack.
     H, W = 256, 256
+    export_torch(model.enc, (torch.randn(1, 3, H, W), torch.ones(1, g_ch_enc_dec, 1, 1)),
+                 os.path.join(out_dir, 'intra_analysis_standard.onnx'), ['in0', 'in1'], 'out0')
     export_torch(model.hyper_enc, torch.randn(1, N, H // 16, W // 16),
                  os.path.join(out_dir, 'intra_hyper_enc.onnx'), ['in0'], 'out0')
     export_torch(model.hyper_dec, torch.randn(1, ZC, H // 64, W // 64),
@@ -91,16 +110,16 @@ def main():
                      os.path.join(out_dir, f'y_spatial_prior_adaptor_{i}.onnx'), ['in0'], 'out0')
     export_torch(model.y_spatial_prior, torch.randn(1, 2 * N, H // 16, W // 16),
                  os.path.join(out_dir, 'y_spatial_prior.onnx'), ['in0'], 'out0')
-    export_torch(model.dec, (torch.randn(1, N, H // 16, W // 16), torch.ones(1, 368, 1, 1)),
+    export_torch(model.dec, (torch.randn(1, N, H // 16, W // 16), torch.ones(1, g_ch_enc_dec, 1, 1)),
                  os.path.join(out_dir, 'intra_synthesis.onnx'), ['in0', 'in1'], 'out0')
 
-    # 3. QP scales
+    # QP scales
     np.save(os.path.join(out_dir, 'q_scale_enc.npy'), model.q_scale_enc.detach().cpu().numpy())
     np.save(os.path.join(out_dir, 'q_scale_dec.npy'), model.q_scale_dec.detach().cpu().numpy())
     print('saved q_scale_enc.npy / q_scale_dec.npy')
 
-    # 4. CDF tables from native assets
-    cdf_src = os.path.join(ROOT, 'native', 'assets', 'decode')
+    # CDF tables from tensorRT assets
+    cdf_src = os.path.join(ROOT, 'tensorRT', 'assets', 'decode')
     for name in ['gaussian_cdf.npy', 'gaussian_cdf_length.npy', 'gaussian_offset.npy',
                  'bitest_cdf.npy', 'bitest_cdf_length.npy', 'bitest_offset.npy']:
         src_path = os.path.join(cdf_src, name)
