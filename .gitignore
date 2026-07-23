@@ -18,6 +18,7 @@ venv/
 *.tar
 *.npy
 *.npz
+*.json
 
 # Shared libraries
 *.so
