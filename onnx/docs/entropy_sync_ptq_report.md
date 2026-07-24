@@ -152,7 +152,27 @@ or CPU ISAs can still desync.
 
 per-tensor u8 was the RD bottleneck, and INT16 removes it — but ORT CPU executes
 16-bit convs in FP32, so the bit-exact property is lost. The two goals are
-orthogonal in this toolchain today.
+orthogonal in this toolchain *with ORT native ops*.
+
+> **Update (2026-07-24): INT8 per-channel via custom op — REVISES the above.**
+> The INT8 row in the verdict table used `QLinearConv`, which forces **per-tensor**
+> activation quantization. With the `com.dcvc::FxpConvI8` custom op (int8×int8→int32,
+> AVX-512 VNNI), we control the full data path and can do **per-output-channel
+> weights** (`W_int8[c]`, per-channel scale `Ws[c]`) paired with per-tensor activation
+> (`x_scale=absmax/127`). This is the lever `QLinearConv` lacked. Revised verdict:
+>
+> | Route                        | Sync | RD cost           | Speedup       | Position                |
+> | ---------------------------- | ---- | ----------------- | ------------- | ----------------------- |
+> | INT8 **per-channel** (custom)| exact| **+6.4% bitrate** | 1.17× compute | **sync+RD+perf solved** |
+> | INT8 per-tensor (QLinearConv)| exact| x3.2 bitrate      | —             | RD unacceptable         |
+>
+> Measured (33-frame akiyo, 256², qp 32, gop 16): stream 113755→120984 B (+6.4%),
+> PSNR −0.010 dB. Integer MAC → int32 accumulate (overflow-safe to cin≈66k) keeps
+> cross-platform bit-exactness by construction. Build: `FxpConvI8` op in
+> `src/fxp/ort_custom_ops.cpp`, export `python/fxp_export_int8.py`, models in
+> `models_int8/`.
+> The previous INT8 failure was a **tooling limitation**, not a fundamental floor.
+
 
 ### Remaining paths to "sync + RD"
 
