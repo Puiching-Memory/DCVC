@@ -46,4 +46,26 @@ static inline void fxp_quantize_act_i32_n(const float* x, int32_t* q, int n, flo
         q[i] = fxp_quantize_act_i32(x[i], inv_scale);
 }
 
+/* ── int8 activation quantization (for FxpConv act_bits=8 mode) ──
+ *
+ * 8-bit activations ([-128,127]) paired with int8 weights enable the
+ * AVX-512 VNNI _mm512_dpbusd path: 128 int8 MAC/cycle vs int16's 32.
+ * Accumulation stays in int32 (safe: max int32 accum for cin=4096 is
+ * 66.6M, far below INT32_MAX), eliminating the int64 widen that throttled
+ * the int16 kernel. */
+static inline int8_t fxp_quantize_act_i8(float v, float inv_scale)
+{
+    float q = v * inv_scale;
+    q = (q >= 0.f) ? floorf(q + 0.5f) : ceilf(q - 0.5f);
+    if (q > 127.f) q = 127.f;
+    if (q < -128.f) q = -128.f;
+    return (int8_t)q;
+}
+
+static inline void fxp_quantize_act_i8_n(const float* x, int8_t* q, int n, float inv_scale)
+{
+    for (int i = 0; i < n; i++)
+        q[i] = fxp_quantize_act_i8(x[i], inv_scale);
+}
+
 #endif

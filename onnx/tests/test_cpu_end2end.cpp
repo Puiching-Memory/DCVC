@@ -304,8 +304,10 @@ static int mode_decode(int argc, char** argv)
 /* ------------------------------------------------------------------ */
 static int mode_roundtrip(int argc, char** argv)
 {
-    const char* model_dir = dcvc_resolve_model_dir(argc > 1 ? argv[1] : NULL,
-                                               "intra_analysis_standard.onnx");
+    const char* model_dir = g_model_dir_override
+        ? g_model_dir_override
+        : dcvc_resolve_model_dir(argc > 1 ? argv[1] : NULL,
+                                 "intra_analysis_standard.onnx");
     int H = argc > 2 ? atoi(argv[2]) : 256;
     int W = argc > 3 ? atoi(argv[3]) : 256;
     int qp = argc > 4 ? atoi(argv[4]) : 32;

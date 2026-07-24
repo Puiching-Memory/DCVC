@@ -38,6 +38,23 @@ void fxp_conv_f32_range(const float* x, float* y,
                   int stride_h, int stride_w, int group, int act_bits,
                   int oc_start, int oc_end);
 
+/* --- int8 (act_bits=8) API: uint8 act × int8 weight, VNNI-accelerated ---
+ * w8_comp[oc] = 128 * sum(w8[oc]) compensates the uint8 activation offset.
+ */
+void fxp_conv1x1_pack_i8(const float* x_nchw, uint8_t* xq_u8_hw_cin,
+                         int cin, int hw, float x_scale);
+void fxp_conv1x1_oc_range_i8(const uint8_t* xq_u8, float* y_nchw,
+                             int cin, int cout, int hw,
+                             const int8_t* w8, const float* w8_scale,
+                             const int32_t* w8_comp, const float* bias,
+                             float x_scale, int oc_start, int oc_end);
+void fxp_conv_im2col_oc_range_i8(const uint8_t* col, float* y_nchw,
+                                 int cin, int cout, int oh, int ow,
+                                 const int8_t* w8, const float* w8_scale,
+                                 const int32_t* w8_comp, const float* bias,
+                                 float x_scale, int kh, int kw,
+                                 int oc_start, int oc_end);
+
 /* --- im2col API (general k×k group=1 conv; for multi-thread ORT) ---
  * 1) fxp_conv_im2col_build: quantize float input + build [oh*ow][cin*kh*kw] int16 col
  * 2) fxp_conv_im2col_oc_range: SIMD GEMM over oc in [oc_start, oc_end)

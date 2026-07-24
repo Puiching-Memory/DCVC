@@ -15,6 +15,7 @@
 
 #include "ort_custom_ops.h"
 #include "fxp_conv.h"
+#include "fxp_common.h"
 #include "det_conv.h"
 #include "fxp_wsrelu.h"
 
@@ -106,6 +107,50 @@ static void im2col_par_fn(void* usr, size_t task)
         fxp_conv_im2col_oc_range(j->col, j->y, j->cin, j->cout, j->oh, j->ow,
                                  j->w_int, j->w_scale, j->bias, j->x_scale,
                                  j->kh, j->kw, oc0, oc1);
+}
+
+struct ConvI8Par {
+    const uint8_t* xq;
+    float* y;
+    int cin, cout, hw, chunk;
+    const int8_t* w8;
+    const float* w_scale;
+    const int32_t* w_comp;
+    const float* bias;
+    float x_scale;
+};
+
+static void conv_i8_par_fn(void* usr, size_t task)
+{
+    auto* j = (ConvI8Par*)usr;
+    int oc0 = (int)task * j->chunk;
+    int oc1 = std::min(oc0 + j->chunk, j->cout);
+    if (oc0 < oc1)
+        fxp_conv1x1_oc_range_i8(j->xq, j->y, j->cin, j->cout, j->hw,
+                                j->w8, j->w_scale, j->w_comp, j->bias,
+                                j->x_scale, oc0, oc1);
+}
+
+struct Im2colI8Par {
+    const uint8_t* col;
+    float* y;
+    int cin, cout, oh, ow, kh, kw, chunk;
+    const int8_t* w8;
+    const float* w_scale;
+    const int32_t* w_comp;
+    const float* bias;
+    float x_scale;
+};
+
+static void im2col_i8_par_fn(void* usr, size_t task)
+{
+    auto* j = (Im2colI8Par*)usr;
+    int oc0 = (int)task * j->chunk;
+    int oc1 = std::min(oc0 + j->chunk, j->cout);
+    if (oc0 < oc1)
+        fxp_conv_im2col_oc_range_i8(j->col, j->y, j->cin, j->cout, j->oh, j->ow,
+                                    j->w8, j->w_scale, j->w_comp, j->bias,
+                                    j->x_scale, j->kh, j->kw, oc0, oc1);
 }
 
 struct WsReluPar {
@@ -467,6 +512,130 @@ struct FxpConvOp : Ort::CustomOpBase<FxpConvOp, FxpConvKernel> {
     }
 };
 
+/* ── FxpConvI8: int8 act × int8 weight, AVX-512 VNNI accelerated ──
+ * Inputs: [X(float), W(int8), B(float), Ws(float per-channel scale), Wcomp(int32 per-channel)]
+ *   Wcomp[oc] = 128 * sum(W[oc])  (compensates the uint8 activation offset)
+ * Output y[oc] = (sum_u8i8(x+128, W) - Wcomp[oc]) * x_scale * Ws[oc] + B[oc]
+ * ~4x faster than int16 FxpConv (VNNI 128 MAC/cycle vs 32). */
+struct FxpConvI8Kernel {
+    float x_scale_;
+    int64_t group_{};
+    int64_t pads_[4]{};
+    int64_t strides_[2]{};
+
+    FxpConvI8Kernel(const OrtApi&, const OrtKernelInfo* info) : x_scale_(read_x_scale(info))
+    {
+        Ort::ConstKernelInfo ki(info);
+        group_ = ki.GetAttribute<int64_t>("group");
+        auto pads = ki.GetAttributes<int64_t>("pads");
+        auto strides = ki.GetAttributes<int64_t>("strides");
+        if (pads.size() != 4 || strides.size() != 2)
+            ORT_CXX_API_THROW("FxpConvI8: pads/strides", ORT_INVALID_ARGUMENT);
+        for (int i = 0; i < 4; i++) pads_[i] = pads[i];
+        strides_[0] = strides[0]; strides_[1] = strides[1];
+        if (group_ < 1) group_ = 1;
+    }
+
+    void Compute(OrtKernelContext* context)
+    {
+        Ort::KernelContext ctx(context);
+        auto X = ctx.GetInput(0);
+        auto W = ctx.GetInput(1);
+        auto B = ctx.GetInput(2);
+        auto Ws = ctx.GetInput(3);
+        auto Wcomp = ctx.GetInput(4);
+        auto shape = X.GetTensorTypeAndShapeInfo().GetShape();
+        auto w_shape = W.GetTensorTypeAndShapeInfo().GetShape();
+        const int N = (int)shape[0], Cin = (int)shape[1], H = (int)shape[2], Ww = (int)shape[3];
+        const int Cout = (int)w_shape[0], kh = (int)w_shape[2], kw = (int)w_shape[3];
+        const int pad_t = (int)pads_[0], pad_l = (int)pads_[1], pad_b = (int)pads_[2], pad_r = (int)pads_[3];
+        const int sh = (int)strides_[0], sw = (int)strides_[1];
+        const int oh = (H + pad_t + pad_b - kh) / sh + 1;
+        const int ow = (Ww + pad_l + pad_r - kw) / sw + 1;
+        auto Y = ctx.GetOutput(0, std::vector<int64_t>{N, Cout, oh, ow});
+
+        const float* xp = X.GetTensorData<float>();
+        float* yp = Y.GetTensorMutableData<float>();
+        const int8_t* w8p = W.GetTensorData<int8_t>();
+        const float* wsp = Ws.GetTensorData<float>();
+        const float* bp = B.GetTensorData<float>();
+        const int32_t* wcomp = Wcomp.GetTensorData<int32_t>();
+        const int hw = H * Ww;
+
+        /* 1x1 group=1 fast path */
+        if (kh == 1 && kw == 1 && group_ == 1 && pad_t == 0 && pad_l == 0
+            && pad_b == 0 && pad_r == 0 && sh == 1 && sw == 1) {
+            std::vector<uint8_t> xq8((size_t)Cin * (size_t)hw);
+            const int ntasks = parallel_tasks(Cout, 8);
+            const int chunk = (Cout + ntasks - 1) / ntasks;
+            for (int ni = 0; ni < N; ni++) {
+                const float* x_n = xp + (size_t)ni * Cin * hw;
+                float* y_n = yp + (size_t)ni * Cout * hw;
+                fxp_conv1x1_pack_i8(x_n, xq8.data(), Cin, hw, x_scale_);
+                ConvI8Par job{xq8.data(), y_n, Cin, Cout, hw, chunk,
+                              w8p, wsp, wcomp, bp, x_scale_};
+                ctx.ParallelFor(conv_i8_par_fn, (size_t)ntasks, 0, &job);
+            }
+            return;
+        }
+
+        /* int8 im2col for general k×k group==1 */
+        if (group_ == 1) {
+            const float inv_x = 1.0f / x_scale_;
+            for (int ni = 0; ni < N; ni++) {
+                const float* x_n = xp + (size_t)ni * Cin * hw;
+                float* y_n = yp + (size_t)ni * Cout * oh * ow;
+                std::vector<uint8_t> xq_nchw((size_t)Cin * hw);
+                for (int i = 0; i < Cin * hw; i++)
+                    xq_nchw[i] = (uint8_t)(fxp_quantize_act_i8(x_n[i], inv_x) + 128);
+                const int k_area = kh * kw;
+                std::vector<uint8_t> col((size_t)oh * ow * Cin * k_area, 128);
+                int pos = 0;
+                for (int s = 0; s < oh * ow; s++) {
+                    int oh_i = s / ow, ow_i = s - oh_i * ow;
+                    pos = 0;
+                    for (int ic = 0; ic < Cin; ic++)
+                        for (int ki = 0; ki < kh; ki++) {
+                            int ih = oh_i * sh + ki - pad_t;
+                            for (int kj = 0; kj < kw; kj++) {
+                                int iw = ow_i * sw + kj - pad_l;
+                                col[(size_t)s * Cin * k_area + pos] =
+                                    ((unsigned)ih < (unsigned)H && (unsigned)iw < (unsigned)Ww)
+                                        ? xq_nchw[(size_t)ic * hw + ih * Ww + iw] : (uint8_t)128;
+                                pos++;
+                            }
+                        }
+                }
+                const int ntasks = parallel_tasks(Cout, 8);
+                const int chunk = (Cout + ntasks - 1) / ntasks;
+                Im2colI8Par job{col.data(), y_n, Cin, Cout, oh, ow, kh, kw, chunk,
+                                w8p, wsp, wcomp, bp, x_scale_};
+                ctx.ParallelFor(im2col_i8_par_fn, (size_t)ntasks, 0, &job);
+            }
+            return;
+        }
+        ORT_CXX_API_THROW("FxpConvI8: only group==1 supported", ORT_INVALID_ARGUMENT);
+    }
+};
+
+struct FxpConvI8Op : Ort::CustomOpBase<FxpConvI8Op, FxpConvI8Kernel> {
+    void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const
+    { return new FxpConvI8Kernel(api, info); }
+    const char* GetName() const { return "FxpConvI8"; }
+    const char* GetExecutionProviderType() const { return "CPUExecutionProvider"; }
+    size_t GetInputTypeCount() const { return 5; }
+    ONNXTensorElementDataType GetInputType(size_t i) const
+    {
+        if (i == 1) return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+        if (i == 4) return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+        return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+    }
+    size_t GetOutputTypeCount() const { return 1; }
+    ONNXTensorElementDataType GetOutputType(size_t) const
+    { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
+};
+
+
 struct FxpWsReluKernel {
     float x_scale_;
     FxpWsReluKernel(const OrtApi&, const OrtKernelInfo* info) : x_scale_(read_x_scale(info)) {}
@@ -618,6 +787,7 @@ struct DetConvOp : Ort::CustomOpBase<DetConvOp, DetConvKernel> {
 static DetConvOp g_det_conv;
 static FxpConv1x1Op g_fxp_conv1x1;
 static FxpConvOp g_fxp_conv;
+static FxpConvI8Op g_fxp_conv_i8;
 static FxpWsReluOp g_fxp_wsrelu;
 static FxpConvWsReluOp g_fxp_conv_wsrelu;
 
@@ -810,7 +980,7 @@ static void init_domain(const OrtApi* api)
         return;
     }
     const OrtCustomOp* ops[] = {
-        &g_det_conv, &g_fxp_conv1x1, &g_fxp_conv, &g_fxp_wsrelu, &g_fxp_conv_wsrelu,
+        &g_det_conv, &g_fxp_conv1x1, &g_fxp_conv, &g_fxp_conv_i8, &g_fxp_wsrelu, &g_fxp_conv_wsrelu,
 #if defined(DCVC_FXP_CUDA)
         &g_fxp_conv1x1_cuda, &g_fxp_conv_cuda, &g_fxp_wsrelu_cuda,
 #endif

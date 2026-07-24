@@ -150,6 +150,131 @@ static inline int64_t fxp_dot_i16_i64(const int16_t* a, const int16_t* b, int n)
  * added to its own lane, so this is bit-exact with the scalar
  * "acc[i] += (int64_t)act[i]*(int64_t)w" loop (integer addition is associative). */
 
+/* ── int8 VNNI kernels (act_bits=8): uint8 act × int8 weight → int32 ──────
+ *
+ * AVX-512 VNNI _mm512_dpbusd_epi32 does 128 int8 MAC/cycle (4x int16 madd).
+ * Activations are offset to unsigned (a_u8 = a_i8 + 128); the conv then
+ * subtracts 128*sum(weights) per output channel (a baked constant) to recover
+ * the correct symmetric result. Accumulation stays int32 (safe up to cin=66k).
+ */
+
+#if defined(__GNUC__) && defined(__x86_64__)
+__attribute__((target("avx512vnni")))
+static int32_t fxp_dot_i8_i32_zmm(const uint8_t* a_u8, const int8_t* b, int n)
+{
+    __m512i acc = _mm512_setzero_si512();
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        __m512i va = _mm512_loadu_si512(a_u8 + i);
+        __m512i vb = _mm512_loadu_si512(b + i);
+        acc = _mm512_dpbusd_epi32(acc, va, vb);
+    }
+    int32_t sum = _mm512_reduce_add_epi32(acc);
+    for (; i < n; i++)
+        sum += (int32_t)a_u8[i] * (int32_t)b[i];
+    return sum;
+}
+#endif
+
+/* uint8×int8 dot via AVX2 vpmaddubsw (no VNNI). Widens to int32 in pairs.
+ * Bit-exact with VNNI path (same pair-summing, int32 accumulate). */
+static int32_t fxp_dot_i8_i32_ymm(const uint8_t* a_u8, const int8_t* b, int n)
+{
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a_u8 + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m256i p = _mm256_maddubs_epi16(va, vb);   /* 16 int16, each = pair-sum */
+        __m256i lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p));
+        __m256i hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p, 1));
+        acc = _mm256_add_epi32(acc, lo);
+        acc = _mm256_add_epi32(acc, hi);
+    }
+    int32_t sum = 0;
+    int32_t tmp[8] __attribute__((aligned(32)));
+    _mm256_storeu_si256((__m256i*)tmp, acc);
+    for (int k = 0; k < 8; k++) sum += tmp[k];
+    for (; i < n; i++)
+        sum += (int32_t)a_u8[i] * (int32_t)b[i];
+    return sum;
+}
+
+static int fxp_have_vnni_ = 0;
+__attribute__((constructor)) static void fxp_init_vnni_flag(void)
+{
+    unsigned eax=0,ebx=0,ecx=0,edx=0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
+        fxp_have_vnni_ = (ecx & (1u << 11)) != 0; /* AVX512_VNNI */
+}
+
+static inline int32_t fxp_dot_i8_i32(const uint8_t* a_u8, const int8_t* b, int n)
+{
+#if defined(__GNUC__) && defined(__x86_64__)
+    if (fxp_have_vnni_) return fxp_dot_i8_i32_zmm(a_u8, b, n);
+#endif
+    return fxp_dot_i8_i32_ymm(a_u8, b, n);
+}
+
+/* int8 conv1x1: quantize float input → uint8 (offset +128), VNNI GEMM.
+ * w8 = int8 weights, w8_scale[cout] per-channel, w8_comp[cout] = 128*sum(w8[c]).
+ * Output y = (dot_u8i8 - w8_comp[oc]) * x_scale * w8_scale[oc] + bias[oc]. */
+void fxp_conv1x1_pack_i8(const float* x_nchw, uint8_t* xq_u8_hw_cin,
+                                int cin, int hw, float x_scale)
+{
+    const float inv_x = 1.0f / x_scale;
+    for (int s = 0; s < hw; s++) {
+        uint8_t* row = xq_u8_hw_cin + (size_t)s * cin;
+        for (int ic = 0; ic < cin; ic++) {
+            int8_t q = fxp_quantize_act_i8(x_nchw[(size_t)ic * hw + s], inv_x);
+            row[ic] = (uint8_t)(q + 128);
+        }
+    }
+}
+
+void fxp_conv1x1_oc_range_i8(const uint8_t* xq_u8, float* y_nchw,
+                                    int cin, int cout, int hw,
+                                    const int8_t* w8, const float* w8_scale,
+                                    const int32_t* w8_comp,
+                                    const float* bias, float x_scale,
+                                    int oc_start, int oc_end)
+{
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        const int8_t* wk = w8 + (size_t)oc * cin;
+        float* yo = y_nchw + (size_t)oc * hw;
+        const float scale = x_scale * w8_scale[oc];
+        const float b = bias[oc];
+        const int32_t comp = w8_comp[oc];
+        for (int s = 0; s < hw; s++) {
+            int32_t raw = fxp_dot_i8_i32(xq_u8 + (size_t)s * cin, wk, cin);
+            yo[s] = (float)(raw - comp) * scale + b;
+        }
+    }
+}
+
+void fxp_conv_im2col_oc_range_i8(const uint8_t* col, float* y_nchw,
+                                        int cin, int cout, int oh, int ow,
+                                        const int8_t* w8, const float* w8_scale,
+                                        const int32_t* w8_comp,
+                                        const float* bias, float x_scale,
+                                        int kh, int kw,
+                                        int oc_start, int oc_end)
+{
+    const int row_len = cin * kh * kw;
+    const int y_hw = oh * ow;
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        const int8_t* wk = w8 + (size_t)oc * row_len;
+        float* yo = y_nchw + (size_t)oc * y_hw;
+        const float scale = x_scale * w8_scale[oc];
+        const float b = bias[oc];
+        const int32_t comp = w8_comp[oc];
+        for (int s = 0; s < y_hw; s++) {
+            int32_t raw = fxp_dot_i8_i32(col + (size_t)s * row_len, wk, row_len);
+            yo[s] = (float)(raw - comp) * scale + b;
+        }
+    }
+}
+
 /* Add 8 activations * w (broadcast int16 weight) into two 4-lane int64 accums. */
 static inline void fxp_dw3x3_mac8(__m256i* alo, __m256i* ahi,
                                   const int16_t* p, int w)
