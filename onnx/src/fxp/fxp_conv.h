@@ -51,9 +51,14 @@ void fxp_conv1x1_oc_range_i16(const int16_t* xq_hw_cin, float* y_nchw,
                               const float* bias, float x_scale,
                               int oc_start, int oc_end);
 
-/* Depthwise 3x3: pack NCHW int16 once, then oc-range. */
-void fxp_dw3x3_pack_i16(const float* x_nchw, int16_t* xq_nchw,
-                        int c, int hw, float x_scale);
+/* Depthwise 3x3: pack NCHW float into a PADDED int16 layout [c][h+2][w+2]
+ * (row stride = w+2). Row 0 and row h+1 are zero, and each data row has a
+ * leading 0 at col 0 and a trailing 0 at col w+1. With this padding the 3x3
+ * convolution needs no per-pixel bounds checks: a zero cell contributes 0*w=0
+ * to the int64 accumulator, identical to the out-of-bounds->0 rule, so it is
+ * bit-exact with the compact bordered version.  xq_pad must hold c*(h+2)*(w+2). */
+void fxp_dw3x3_pack_i16(const float* x_nchw, int16_t* xq_pad,
+                        int c, int h, int w, float x_scale);
 
 void fxp_dw3x3_oc_range_i16(const int16_t* xq_nchw, float* y_nchw,
                             int c, int h, int w,

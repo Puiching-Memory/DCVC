@@ -272,6 +272,7 @@ dcvc_onnx_add_executable(test_fxp_opt_bitexact
 
 dcvc_onnx_add_executable(bench_fxp_conv
     SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_wsrelu.c
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fxp_baseline_kernels.c
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_fxp_conv.cpp)
 if(NOT MSVC)

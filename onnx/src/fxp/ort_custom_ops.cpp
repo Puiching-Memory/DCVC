@@ -258,7 +258,7 @@ struct FxpConvWsReluKernel {
             ORT_CXX_API_THROW("FxpConvWsRelu: only 1x1 or dw3x3 fused", ORT_INVALID_ARGUMENT);
 
         const int hw = H * Ww;
-        std::vector<int16_t> xq((size_t)Cin * (size_t)hw);
+        std::vector<int16_t> xq((size_t)Cin * (size_t)(H + 2) * (size_t)(Ww + 2));
         const int ntasks = parallel_tasks(Cout, is_dw ? 4 : 8);
         const int chunk = (Cout + ntasks - 1) / ntasks;
 
@@ -266,7 +266,7 @@ struct FxpConvWsReluKernel {
             const float* x_n = xp + (size_t)ni * Cin * hw;
             float* y_n = yp + (size_t)ni * Cout * hw;
             if (is_dw)
-                fxp_dw3x3_pack_i16(x_n, xq.data(), Cin, hw, x_scale_);
+                fxp_dw3x3_pack_i16(x_n, xq.data(), Cin, H, Ww, x_scale_);
             else
                 fxp_conv1x1_pack_i16(x_n, xq.data(), Cin, hw, x_scale_);
             ConvWsPar job{xq.data(), y_n, Cin, Cout, hw, H, Ww, chunk, is_dw ? 1 : 0,
@@ -385,13 +385,13 @@ struct FxpConvKernel {
             && pad_t == 1 && pad_l == 1 && pad_b == 1 && pad_r == 1
             && sh == 1 && sw == 1) {
             const int hw = H * Ww;
-            std::vector<int16_t> xq((size_t)Cin * (size_t)hw);
+            std::vector<int16_t> xq((size_t)Cin * (size_t)(H + 2) * (size_t)(Ww + 2));
             const int ntasks = parallel_tasks(Cout, 4);
             const int chunk = (Cout + ntasks - 1) / ntasks;
             for (int ni = 0; ni < N; ni++) {
                 const float* x_n = xp + (size_t)ni * Cin * hw;
                 float* y_n = yp + (size_t)ni * Cout * hw;
-                fxp_dw3x3_pack_i16(x_n, xq.data(), Cin, hw, x_scale_);
+                fxp_dw3x3_pack_i16(x_n, xq.data(), Cin, H, Ww, x_scale_);
                 Dw3x3Par job{xq.data(), y_n, Cin, H, Ww, chunk, wp, wsp, bp, x_scale_};
                 ctx.ParallelFor(dw3x3_par_fn, (size_t)ntasks, 0, &job);
             }

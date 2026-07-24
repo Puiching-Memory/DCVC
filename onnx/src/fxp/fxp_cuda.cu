@@ -36,24 +36,75 @@ __global__ void k_quant_nchw(const float* x, int16_t* xq, int n_elem, float inv_
         xq[i] = fxp_quant_dev(x[i], inv_x);
 }
 
+/* k_conv1x1 tile configuration (output-stationary tiled GEMM, int64 MAC).
+ * OC_TILE output channels x S_TILE spatial positions per CTA; the cin
+ * reduction is tiled in chunks of RED so shared-memory use is bounded
+ * regardless of cin.  Integer accumulation is associative, so the MAC order
+ * is bit-exact with the CPU scalar loop; the dequant below is unchanged
+ * (no FMA). */
+constexpr int C1_OC_TILE = 16;
+constexpr int C1_S_TILE = 16;
+constexpr int C1_RED = 32;
+
 __global__ void k_conv1x1(const int16_t* xq, const int16_t* w_int,
                           const float* w_scale, const float* bias,
                           float* y, int cin, int cout, int hw, float x_scale)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = cout * hw;
-    if (idx >= total) return;
-    int oc = idx / hw;
-    int s = idx - oc * hw;
-    const int16_t* xs = xq + (size_t)s * cin;
-    const int16_t* wk = w_int + (size_t)oc * cin;
+    extern __shared__ int16_t smem[];
+    int16_t* s_act = smem;                       /* [S_TILE][RED] */
+    int16_t* s_wgt = smem + C1_S_TILE * C1_RED;  /* [OC_TILE][RED] */
+
+    const int oc0 = blockIdx.x * C1_OC_TILE;
+    const int s0 = blockIdx.y * C1_S_TILE;
+    const int tid = threadIdx.x;
+    const int oc_local = tid / C1_S_TILE;
+    const int s_local = tid - oc_local * C1_S_TILE;
+    const int oc = oc0 + oc_local;
+    const int s = s0 + s_local;
+    const bool valid = (oc < cout) && (s < hw);
+
     long long acc = 0;
-    for (int ic = 0; ic < cin; ic++)
-        acc += (long long)xs[ic] * (long long)wk[ic];
-    /* No FMA: must match CPU (float)acc * scale + bias. */
-    float scale = __fmul_rn(x_scale, w_scale[oc]);
-    float t = __fmul_rn((float)acc, scale);
-    y[oc * hw + s] = __fadd_rn(t, bias[oc]);
+
+    for (int r0 = 0; r0 < cin; r0 += C1_RED) {
+        /* Cooperatively load the activation tile (S_TILE x RED) into smem.
+         * Out-of-range spatial positions and the cin remainder are padded
+         * with 0, which contributes nothing to the int64 sum. */
+        for (int k = tid; k < C1_S_TILE * C1_RED; k += C1_OC_TILE * C1_S_TILE) {
+            int sl = k / C1_RED;
+            int ri = k - sl * C1_RED;
+            int s_g = s0 + sl;
+            int ic = r0 + ri;
+            s_act[sl * C1_RED + ri] =
+                ((unsigned)s_g < (unsigned)hw && ic < cin)
+                    ? xq[(size_t)s_g * cin + ic] : (int16_t)0;
+        }
+        /* Cooperatively load the weight tile (OC_TILE x RED) into smem. */
+        for (int k = tid; k < C1_OC_TILE * C1_RED; k += C1_OC_TILE * C1_S_TILE) {
+            int ol = k / C1_RED;
+            int ri = k - ol * C1_RED;
+            int oc_g = oc0 + ol;
+            int ic = r0 + ri;
+            s_wgt[ol * C1_RED + ri] =
+                ((unsigned)oc_g < (unsigned)cout && ic < cin)
+                    ? w_int[(size_t)oc_g * cin + ic] : (int16_t)0;
+        }
+        __syncthreads();
+
+        if (valid) {
+            const int16_t* arow = s_act + s_local * C1_RED;
+            const int16_t* wrow = s_wgt + oc_local * C1_RED;
+            for (int ri = 0; ri < C1_RED; ri++)
+                acc += (long long)arow[ri] * (long long)wrow[ri];
+        }
+        __syncthreads();
+    }
+
+    if (valid) {
+        /* No FMA: must match CPU (float)acc * scale + bias. */
+        float scale = __fmul_rn(x_scale, w_scale[oc]);
+        float t = __fmul_rn((float)acc, scale);
+        y[oc * hw + s] = __fadd_rn(t, bias[oc]);
+    }
 }
 
 __global__ void k_dw3x3(const int16_t* xq, const int16_t* w_int,
@@ -91,8 +142,20 @@ __global__ void k_wsrelu(const float* x, float* y, const float* lut,
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_elem) return;
-    int16_t q = fxp_quant_dev(x[i], inv_x);
-    y[i] = lut[(int)q + 32768];
+    /* Match the CPU baseline (fxp_wsrelu_f32_range): linear interpolation
+     * between adjacent LUT entries instead of a truncating direct lookup.
+     * Plain float ops + floorf are IEEE round-to-nearest -> bit-exact. */
+    float scaled = x[i] * inv_x;
+    if (scaled >= 32767.0f) {
+        y[i] = lut[65535];
+    } else if (scaled <= -32768.0f) {
+        y[i] = lut[0];
+    } else {
+        float fl = floorf(scaled);
+        int idx = (int)fl + 32768;
+        float frac = scaled - fl;
+        y[i] = lut[idx] + (lut[idx + 1] - lut[idx]) * frac;
+    }
 }
 
 struct DevScratch {
@@ -163,10 +226,13 @@ extern "C" int fxp_conv1x1_f32_cuda(const float* x, float* y,
         if (launch_ok(cudaGetLastError(), "k_quant_pack_nhwc"))
             return 3;
 
-        int total = cout * hw;
-        int blocks = (total + threads - 1) / threads;
-        k_conv1x1<<<blocks, threads, 0, st>>>(xq, w_int, w_scale, bias, y_n,
-                                              cin, cout, hw, x_scale);
+        dim3 grid((cout + C1_OC_TILE - 1) / C1_OC_TILE,
+                  (hw + C1_S_TILE - 1) / C1_S_TILE);
+        const int block = C1_OC_TILE * C1_S_TILE;
+        const size_t smem_bytes =
+            (size_t)(C1_S_TILE + C1_OC_TILE) * C1_RED * sizeof(int16_t);
+        k_conv1x1<<<grid, block, smem_bytes, st>>>(xq, w_int, w_scale, bias,
+                                                   y_n, cin, cout, hw, x_scale);
         if (launch_ok(cudaGetLastError(), "k_conv1x1"))
             return 4;
     }
