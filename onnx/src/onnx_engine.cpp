@@ -246,6 +246,17 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     int ep = dcvc_requested_ep(use_gpu);
     if (ep != 0) dcvc_log_ep_once(ep, dcvc_try_append_gpu_ep(api, eng->opts, ep));
 
+    /* Optional ORT per-op profiling: set DCVC_PROFILE=<prefix> to emit
+     * <prefix>.*.json trace files (one per session/engine). */
+    {
+        const char* prof = getenv("DCVC_PROFILE");
+        if (prof && prof[0]) {
+            st = api->EnableProfiling(eng->opts, prof);
+            check_status(api, st, out_st);
+            if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
+        }
+    }
+
 #ifdef _WIN32
     auto _wpath = dcvc_to_wide(onnx_path);
     st = api->CreateSession(eng->env, _wpath.c_str(), eng->opts, &eng->session);

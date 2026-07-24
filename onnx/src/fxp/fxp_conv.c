@@ -315,6 +315,8 @@ static inline void fxp_conv1x1_dot_oc(const int16_t* xs, const int16_t* wk_base,
 static FXP_TLS int16_t* fxp_tls_i16 = NULL;
 static FXP_TLS size_t fxp_tls_i16_cap = 0;
 static FXP_TLS int32_t* fxp_tls_i32 = NULL;
+static FXP_TLS int16_t* fxp_tls_i16_col = NULL;
+static FXP_TLS size_t fxp_tls_i16_col_cap = 0;
 static FXP_TLS size_t fxp_tls_i32_cap = 0;
 
 static int16_t* fxp_scratch_i16(size_t n_elem)
@@ -337,6 +339,17 @@ static int32_t* fxp_scratch_i32(size_t n_elem)
         fxp_tls_i32_cap = n_elem;
     }
     return fxp_tls_i32;
+}
+
+static int16_t* fxp_scratch_i16_col(size_t n_elem)
+{
+    if (n_elem > fxp_tls_i16_col_cap) {
+        int16_t* p = (int16_t*)realloc(fxp_tls_i16_col, n_elem * sizeof(int16_t));
+        if (!p) return NULL;
+        fxp_tls_i16_col = p;
+        fxp_tls_i16_col_cap = n_elem;
+    }
+    return fxp_tls_i16_col;
 }
 
 enum { FXP_OC_TILE = 4, FXP_S_TILE = 8 };
@@ -639,6 +652,160 @@ static void fxp_dwconv3x3_fast(const float* x, float* y,
     }
 }
 
+/* ── im2col + SIMD GEMM for general (non-1x1, non-dw) convs ──────────────
+ *
+ * The old general path was scalar int64 MAC with per-access re-quantization
+ * (each input value quantized up to kh*kw times). This version:
+ *   1. Pre-quantizes the input ONCE (NCHW float → int16)
+ *   2. Builds an im2col matrix [oh*ow][cin*k_area] of int16
+ *   3. SIMD dot-product each im2col row with the weight vector
+ *
+ * Bit-exact with the scalar path: the int16 quantized values are identical
+ * (same float input, same inv_x, deterministic rounding), and integer addition
+ * is associative so the MAC reordering does not change the result.
+ */
+
+/* Build im2col for one spatial tile [s0, s0+ns) into a contiguous int16 buffer.
+ * Layout per row: [cin][kh][kw] (matches weight [cout][cin][kh][kw] inner order).
+ * Out-of-bounds positions are zero (same as the scalar bounds check). */
+void fxp_im2col_tile(const int16_t* xq_nchw, int cin, int h, int w,
+                            int kh, int kw, int pad_t, int pad_l,
+                            int stride_h, int stride_w,
+                            int oh, int ow, int s0, int ns,
+                            int16_t* col /* [ns][cin*kh*kw] */)
+{
+    const int x_hw = h * w;
+    const int k_area = kh * kw;
+    const int row_len = cin * k_area;
+
+    for (int si = 0; si < ns; si++) {
+        const int spat = s0 + si;
+        const int oh_i = spat / ow;
+        const int ow_i = spat - oh_i * ow;
+        int16_t* row = col + (size_t)si * row_len;
+        int idx = 0;
+        for (int ic = 0; ic < cin; ic++) {
+            const int16_t* xc = xq_nchw + (size_t)ic * x_hw;
+            for (int ki = 0; ki < kh; ki++) {
+                const int ih = oh_i * stride_h + ki - pad_t;
+                for (int kj = 0; kj < kw; kj++) {
+                    const int iw = ow_i * stride_w + kj - pad_l;
+                    int16_t v = 0;
+                    if ((unsigned)ih < (unsigned)h && (unsigned)iw < (unsigned)w)
+                        v = xc[ih * w + iw];
+                    row[idx++] = v;
+                }
+            }
+        }
+    }
+}
+
+/* im2col GEMM over an oc-range: for each output channel in [oc_start,oc_end),
+ * dot-product every im2col row with the weight vector.
+ * ns = number of spatial positions in the current tile. */
+void fxp_conv_im2col_oc_range(const int16_t* col, float* y_nchw,
+                              int cin, int cout, int oh, int ow,
+                              const int16_t* w_int, const float* w_scale,
+                              const float* bias, float x_scale,
+                              int kh, int kw,
+                              int oc_start, int oc_end)
+{
+    const int k_area = kh * kw;
+    const int row_len = cin * k_area;
+    const int y_hw = oh * ow;
+
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        const int16_t* wk = w_int + (size_t)oc * row_len;
+        float* yo = y_nchw + (size_t)oc * y_hw;
+        const float scale = x_scale * w_scale[oc];
+        const float b = bias[oc];
+        for (int s = 0; s < y_hw; s++) {
+            const int16_t* row = col + (size_t)s * row_len;
+#if defined(__AVX2__)
+            int64_t acc = fxp_dot_i16_i64(row, wk, row_len);
+#else
+            int64_t acc = 0;
+            for (int i = 0; i < row_len; i++)
+                acc += (int64_t)row[i] * (int64_t)wk[i];
+#endif
+            yo[s] = (float)acc * scale + b;
+        }
+    }
+}
+
+/* Exposed build: quantize + im2col into TLS scratch. Returns col pointer. */
+int16_t* fxp_conv_im2col_build(const float* x_nchw, int cin, int h, int w,
+                               int kh, int kw, int pad_t, int pad_l,
+                               int stride_h, int stride_w,
+                               int oh, int ow, float x_scale)
+{
+    const float inv_x = 1.0f / x_scale;
+    const int x_hw = h * w;
+
+    int16_t* xq = fxp_scratch_i16((size_t)cin * (size_t)x_hw);
+    if (!xq) return NULL;
+    for (int i = 0; i < cin * x_hw; i++)
+        xq[i] = fxp_quantize_act(x_nchw[i], inv_x);
+
+    const int k_area = kh * kw;
+    int16_t* col = fxp_scratch_i16_col((size_t)oh * (size_t)ow *
+                                       (size_t)cin * (size_t)k_area);
+    if (!col) return NULL;
+    fxp_im2col_tile(xq, cin, h, w, kh, kw, pad_t, pad_l,
+                    stride_h, stride_w, oh, ow, 0,
+                    oh * ow, col);
+    return col;
+}
+
+/* Full im2col fast path: pre-quantize, build col, SIMD GEMM.
+ * Replaces the 7-nested-loop scalar general path. */
+static void fxp_conv_im2col_fast(const float* x, float* y,
+                                 int n, int cin, int cout, int h, int w,
+                                 const int16_t* w_int, const float* w_scale,
+                                 const float* bias, float x_scale, int act_bits,
+                                 int kh, int kw,
+                                 int pad_t, int pad_l, int pad_b, int pad_r,
+                                 int stride_h, int stride_w, int group)
+{
+    /* Only group==1 uses this path (grouped convs are rare in these models). */
+    const float inv_x = 1.0f / x_scale;
+    const int x_hw = h * w;
+    const int oh = (h + pad_t + pad_b - kh) / stride_h + 1;
+    const int ow = (w + pad_l + pad_r - kw) / stride_w + 1;
+    const int y_hw = oh * ow;
+    const int k_area = kh * kw;
+
+    /* Pre-quantize input ONCE: NCHW float → int16. */
+    int16_t* xq = fxp_scratch_i16((size_t)cin * (size_t)x_hw);
+    if (!xq) return;
+
+    /* im2col buffer: [y_hw][cin*k_area] int16. */
+    int16_t* col = fxp_scratch_i16_col((size_t)y_hw * (size_t)cin * (size_t)k_area);
+    if (!col) return;
+
+    for (int ni = 0; ni < n; ni++) {
+        const float* x_n = x + (size_t)ni * cin * x_hw;
+        float* y_n = y + (size_t)ni * cout * y_hw;
+
+        /* Quantize input. */
+        for (int i = 0; i < cin * x_hw; i++) {
+            if (act_bits >= 24)
+                xq[i] = (int16_t)fxp_quantize_act_i32(x_n[i], inv_x);
+            else
+                xq[i] = fxp_quantize_act(x_n[i], inv_x);
+        }
+
+        /* Build full im2col matrix. */
+        fxp_im2col_tile(xq, cin, h, w, kh, kw, pad_t, pad_l,
+                        stride_h, stride_w, oh, ow, 0, y_hw, col);
+
+        /* SIMD GEMM over all output channels. */
+        fxp_conv_im2col_oc_range(col, y_n, cin, cout, oh, ow,
+                                 w_int, w_scale, bias, x_scale,
+                                 kh, kw, 0, cout);
+    }
+}
+
 void fxp_conv_f32(const float* x, float* y,
                   int n, int cin, int cout, int h, int w,
                   const int16_t* w_int, const float* w_scale, const float* bias,
@@ -657,6 +824,14 @@ void fxp_conv_f32(const float* x, float* y,
         && pad_t == 1 && pad_l == 1 && pad_b == 1 && pad_r == 1
         && stride_h == 1 && stride_w == 1) {
         fxp_dwconv3x3_fast(x, y, n, cin, h, w, w_int, w_scale, bias, x_scale, act_bits);
+        return;
+    }
+
+    /* im2col + SIMD GEMM for group==1 general convs (was scalar, ~100x slower). */
+    if (group == 1 && act_bits < 24) {
+        fxp_conv_im2col_fast(x, y, n, cin, cout, h, w, w_int, w_scale, bias,
+                             x_scale, act_bits, kh, kw,
+                             pad_t, pad_l, pad_b, pad_r, stride_h, stride_w, group);
         return;
     }
 

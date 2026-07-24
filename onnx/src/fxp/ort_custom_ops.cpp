@@ -87,6 +87,27 @@ static void dw3x3_par_fn(void* usr, size_t task)
                                oc0, oc1);
 }
 
+struct Im2colPar {
+    const int16_t* col;
+    float* y;
+    int cin, cout, oh, ow, kh, kw, chunk;
+    const int16_t* w_int;
+    const float* w_scale;
+    const float* bias;
+    float x_scale;
+};
+
+static void im2col_par_fn(void* usr, size_t task)
+{
+    auto* j = (Im2colPar*)usr;
+    int oc0 = (int)task * j->chunk;
+    int oc1 = std::min(oc0 + j->chunk, j->cout);
+    if (oc0 < oc1)
+        fxp_conv_im2col_oc_range(j->col, j->y, j->cin, j->cout, j->oh, j->ow,
+                                 j->w_int, j->w_scale, j->bias, j->x_scale,
+                                 j->kh, j->kw, oc0, oc1);
+}
+
 struct WsReluPar {
     const float* x;
     float* y;
@@ -394,6 +415,30 @@ struct FxpConvKernel {
                 fxp_dw3x3_pack_i16(x_n, xq.data(), Cin, H, Ww, x_scale_);
                 Dw3x3Par job{xq.data(), y_n, Cin, H, Ww, chunk, wp, wsp, bp, x_scale_};
                 ctx.ParallelFor(dw3x3_par_fn, (size_t)ntasks, 0, &job);
+            }
+            return;
+        }
+
+        /* General k×k group==1 conv: im2col + SIMD GEMM with ParallelFor. */
+        if (act_bits_ == 16 && group_ == 1) {
+            const int hw = H * Ww;
+            for (int ni = 0; ni < N; ni++) {
+                const float* x_n = xp + (size_t)ni * Cin * hw;
+                float* y_n = yp + (size_t)ni * Cout * oh * ow;
+                int16_t* col = fxp_conv_im2col_build(x_n, Cin, H, Ww,
+                                                     kh, kw, pad_t, pad_l,
+                                                     sh, sw, oh, ow, x_scale_);
+                if (!col) {
+                    fxp_conv_f32(xp, yp, N, Cin, Cout, H, Ww, wp, wsp, bp, x_scale_,
+                                 kh, kw, pad_t, pad_l, pad_b, pad_r, sh, sw,
+                                 (int)group_, act_bits_);
+                    break;
+                }
+                const int ntasks = parallel_tasks(Cout, 8);
+                const int chunk = (Cout + ntasks - 1) / ntasks;
+                Im2colPar job{col, y_n, Cin, Cout, oh, ow, kh, kw, chunk,
+                              wp, wsp, bp, x_scale_};
+                ctx.ParallelFor(im2col_par_fn, (size_t)ntasks, 0, &job);
             }
             return;
         }

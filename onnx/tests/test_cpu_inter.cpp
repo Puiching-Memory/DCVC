@@ -154,10 +154,13 @@ static int read_raw_file(const char* path, void** out_data, size_t* out_size)
 
 /* Encode a multi-frame .npy (N,3,H,W) to a self-describing bitstream:
  *   magic "DCVS" (4)
- *   N (uint32), H (uint32), W (uint32), qp_i (uint32), qp_p (uint32) (20)
+ *   N (uint32), H (uint32), W (uint32), qp_i (uint32), qp_p (uint32), gop (uint32) (24)
  *   for each frame:
  *       frame_size (uint32)
  *       frame_stream
+ *
+ * gop <= 0: only frame 0 is an I-frame (legacy single-I layout).
+ * gop  > 0: frame f is an I-frame when (f % gop == 0), otherwise a P-frame.
  */
 static int mode_encode(int argc, char** argv)
 {
@@ -165,7 +168,8 @@ static int mode_encode(int argc, char** argv)
     const char* bin = argc > 3 ? argv[3] : "dcvc_sequence.bin";
     int qp_i = argc > 4 ? atoi(argv[4]) : 32;
     int qp_p = argc > 5 ? atoi(argv[5]) : 32;
-    if (!npy) { fprintf(stderr, "usage: --encode <npy> <bin> [qp_i] [qp_p]\n"); return 1; }
+    int gop  = argc > 6 ? atoi(argv[6]) : 0;
+    if (!npy) { fprintf(stderr, "usage: --encode <npy> <bin> [qp_i] [qp_p] [gop]\n"); return 1; }
 
     int ndims = 0, shape[8] = {0};
     if (dcvc_npy_read_meta(npy, &ndims, shape, 8) != 0 || ndims != 4) {
@@ -174,10 +178,11 @@ static int mode_encode(int argc, char** argv)
     int N = shape[0], H = shape[2], W = shape[3];
     if (shape[1] != 3) { fprintf(stderr, "expected C=3, got %d\n", shape[1]); return 1; }
     if (N < 1) { fprintf(stderr, "need at least one frame\n"); return 1; }
+    if (gop < 0) { fprintf(stderr, "gop must be >= 0 (0 = single I-frame)\n"); return 1; }
 
     const char* model_dir = resolve_model_dir("intra_analysis_standard.onnx");
-    printf("ENCODE sequence: %s N=%d %dx%d qp_i=%d qp_p=%d -> %s\n",
-           npy, N, H, W, qp_i, qp_p, bin);
+    printf("ENCODE sequence: %s N=%d %dx%d qp_i=%d qp_p=%d gop=%d -> %s\n",
+           npy, N, H, W, qp_i, qp_p, gop, bin);
 
     DcvcCpuStatus st;
     DcvcCpuIntraPipeline* intra = dcvc_cpu_intra_pipeline_create(model_dir, H, W, qp_i, &st);
@@ -189,8 +194,9 @@ static int mode_encode(int argc, char** argv)
     fwrite(DCVS_MAGIC, 1, 4, out);
     uint32_t nu = (uint32_t)N, hu = (uint32_t)H, wu = (uint32_t)W;
     uint32_t qiu = (uint32_t)qp_i, qpu = (uint32_t)qp_p;
+    uint32_t gopu = (uint32_t)gop;
     fwrite(&nu, 4, 1, out); fwrite(&hu, 4, 1, out); fwrite(&wu, 4, 1, out);
-    fwrite(&qiu, 4, 1, out); fwrite(&qpu, 4, 1, out);
+    fwrite(&qiu, 4, 1, out); fwrite(&qpu, 4, 1, out); fwrite(&gopu, 4, 1, out);
 
     float* ref = (float*)malloc(3 * H * W * sizeof(float));
     float* x_hat = (float*)malloc(3 * H * W * sizeof(float));
@@ -199,11 +205,12 @@ static int mode_encode(int argc, char** argv)
     size_t total = 0;
     for (int f = 0; f < N; f++) {
         set_dump_frame(f);
+        int is_intra = (gop <= 0) ? (f == 0) : (f % gop == 0);
         int dims[3];
         float* x = load_frame(npy, f, dims, &H, &W);
         if (!x) { fprintf(stderr, "failed to load frame %d\n", f); return 1; }
         uint8_t* stream = NULL; size_t sfn = 0;
-        if (f == 0) {
+        if (is_intra) {
             st = dcvc_cpu_intra_pipeline_encode(intra, x, &stream, &sfn, x_hat);
         } else {
             st = dcvc_cpu_inter_pipeline_encode(inter, x, ref, &stream, &sfn, x_hat);
@@ -213,7 +220,7 @@ static int mode_encode(int argc, char** argv)
         uint32_t len = (uint32_t)sfn;
         fwrite(&len, 4, 1, out); fwrite(stream, 1, sfn, out);
         total += sfn;
-        printf("frame %d (%s): %zu bytes\n", f, f == 0 ? "I" : "P", sfn);
+        printf("frame %d (%s): %zu bytes\n", f, is_intra ? "I" : "P", sfn);
         memcpy(ref, x_hat, 3 * H * W * sizeof(float));
         free(stream);
     }
@@ -221,7 +228,7 @@ static int mode_encode(int argc, char** argv)
     dcvc_cpu_intra_pipeline_destroy(intra);
     dcvc_cpu_inter_pipeline_destroy(inter);
     free(ref); free(x_hat);
-    printf("wrote %s: header=24 bytes, streams=%zu bytes (%.2f KB)\n",
+    printf("wrote %s: header=28 bytes, streams=%zu bytes (%.2f KB)\n",
            bin, total, total / 1024.0);
     return 0;
 }
@@ -233,14 +240,15 @@ static int mode_decode(int argc, char** argv)
     const char* npy = argc > 3 ? argv[3] : "dcvc_sequence_dec.npy";
     void* raw = NULL; size_t raw_size = 0;
     if (read_raw_file(bin, &raw, &raw_size) != 0) { fprintf(stderr, "failed to read %s\n", bin); return 1; }
-    if (raw_size < 24 || memcmp(raw, DCVS_MAGIC, 4) != 0) {
+    if (raw_size < 28 || memcmp(raw, DCVS_MAGIC, 4) != 0) {
         fprintf(stderr, "%s: not a DCVS container\n", bin); return 1;
     }
-    uint32_t N, H, W, qp_i, qp_p;
+    uint32_t N, H, W, qp_i, qp_p, gop;
     memcpy(&N, (char*)raw + 4, 4); memcpy(&H, (char*)raw + 8, 4); memcpy(&W, (char*)raw + 12, 4);
     memcpy(&qp_i, (char*)raw + 16, 4); memcpy(&qp_p, (char*)raw + 20, 4);
-    printf("DECODE sequence: %s N=%u %dx%d qp_i=%u qp_p=%u -> %s\n",
-           bin, N, H, W, qp_i, qp_p, npy);
+    memcpy(&gop, (char*)raw + 24, 4);
+    printf("DECODE sequence: %s N=%u %dx%d qp_i=%u qp_p=%u gop=%u -> %s\n",
+           bin, N, H, W, qp_i, qp_p, gop, npy);
 
     const char* model_dir = resolve_model_dir("intra_analysis_standard.onnx");
     DcvcCpuStatus st;
@@ -253,14 +261,15 @@ static int mode_decode(int argc, char** argv)
     float* all = (float*)malloc((size_t)N * 3 * H * W * sizeof(float));
     if (!ref || !x_hat || !all) { fprintf(stderr, "oom\n"); return 1; }
 
-    const uint8_t* p = (const uint8_t*)raw + 24;
-    size_t remain = raw_size - 24;
+    const uint8_t* p = (const uint8_t*)raw + 28;
+    size_t remain = raw_size - 28;
     for (uint32_t f = 0; f < N; f++) {
         set_dump_frame((int)f);
+        int is_intra = (gop <= 0) ? (f == 0) : (f % gop == 0);
         if (remain < 4) { fprintf(stderr, "truncated: frame %u length missing\n", f); return 1; }
         uint32_t len; memcpy(&len, p, 4); p += 4; remain -= 4;
         if (remain < len) { fprintf(stderr, "truncated: frame %u stream missing\n", f); return 1; }
-        if (f == 0) {
+        if (is_intra) {
             st = dcvc_cpu_intra_pipeline_decode(intra, p, len, x_hat);
         } else {
             st = dcvc_cpu_inter_pipeline_decode(inter, p, len, ref, x_hat);
@@ -269,7 +278,7 @@ static int mode_decode(int argc, char** argv)
         memcpy(all + (size_t)f * 3 * H * W, x_hat, 3 * H * W * sizeof(float));
         memcpy(ref, x_hat, 3 * H * W * sizeof(float));
         p += len; remain -= len;
-        printf("frame %u (%s): %u bytes\n", f, f == 0 ? "I" : "P", len);
+        printf("frame %u (%s): %u bytes\n", f, is_intra ? "I" : "P", len);
     }
     free(raw);
     dcvc_cpu_intra_pipeline_destroy(intra);
@@ -299,9 +308,10 @@ int main(int argc, char** argv) {
         printf("Usage:\n");
         printf("  test_cpu_inter[.exe] [N] [H] [W] [qp_i] [qp_p]\n");
         printf("      In-process synthetic I+P round-trip (default 5 256 256 32 32).\n");
-        printf("  test_cpu_inter[.exe] --encode <npy> <bin> [qp_i] [qp_p]\n");
+        printf("  test_cpu_inter[.exe] --encode <npy> <bin> [qp_i] [qp_p] [gop]\n");
         printf("      Encode a single (N,3,H,W) float32 npy to a self-describing bitstream.\n");
-        printf("      Frame 0 is I-frame, frames 1..N-1 are P-frames.\n");
+        printf("      gop<=0 (default): frame 0 is I-frame, rest are P-frames.\n");
+        printf("      gop >0: frame f is I-frame when f%%gop==0 (periodic I refresh).\n");
         printf("  test_cpu_inter[.exe] --decode <bin> <npy>\n");
         printf("      Decode a self-describing bitstream to a (N,3,H,W) float32 npy.\n");
         printf("\n  --model-dir <dir> is optional in all modes (auto-detected otherwise).\n");
