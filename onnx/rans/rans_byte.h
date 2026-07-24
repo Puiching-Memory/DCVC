@@ -139,3 +139,40 @@ static inline void RansDecAdvance(RansState& r, uint8_t*& ptr, uint32_t start, u
         r = (r << 8) | *ptr++;
     }
 }
+
+// --------------------------------------------------------------------------
+// Runtime-protection variants: bounds-checked against a stream end pointer.
+// These guard the renormalization byte reads (the unbounded *ptr++ in the
+// versions above) so that a desynchronized decoder cannot walk off the buffer.
+// Returns false (and leaves the state untouched past the failure point) when
+// the stream would be overread; the caller must treat that as a fatal decode
+// error (see RansDecoderLib::has_error()).
+// --------------------------------------------------------------------------
+
+// Bounds-checked decoder init. Returns false if fewer than 4 bytes remain
+// (the 32-bit rANS state cannot be initialized).
+static inline bool RansDecInitSafe(RansState& r, uint8_t*& ptr, const uint8_t* end)
+{
+    if (ptr + 4 > end) return false;
+    r = (uint32_t)ptr[0]
+      | ((uint32_t)ptr[1] << 8)
+      | ((uint32_t)ptr[2] << 16)
+      | ((uint32_t)ptr[3] << 24);
+    ptr += 4;
+    return true;
+}
+
+// Bounds-checked symbol advance. Returns false on stream overread.
+static inline bool RansDecAdvanceSafe(RansState& r, uint8_t*& ptr, const uint8_t* end,
+                                      uint32_t start, uint32_t freq)
+{
+    // s, x = D(x)
+    r = freq * (r >> SCALE_BITS) + (r & DEC_MASK) - start;
+
+    // renormalize
+    while (r < RANS_BYTE_L) {
+        if (ptr >= end) return false;
+        r = (r << 8) | *ptr++;
+    }
+    return true;
+}

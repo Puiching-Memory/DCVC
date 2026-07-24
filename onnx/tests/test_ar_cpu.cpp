@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "console_pause.h"
 
 static int read_f32_npy_dims(const char* path, float** out_data, int dims[4])
 {
@@ -53,7 +54,7 @@ int main(int argc, char** argv)
     DcvcCpuArCodec* c = dcvc_cpu_ar_codec_create(model_dir, n_ch, &st);
     if (!c) {
         fprintf(stderr, "create failed: %s\n", dcvc_cpu_status_string(st));
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
 
     float *y = NULL, *pf = NULL;
@@ -63,8 +64,8 @@ int main(int argc, char** argv)
     int y_dims[4] = {0}, pf_dims[4] = {0};
 
     if (y_npy && pf_npy) {
-        if (read_f32_npy_dims(y_npy, &y, y_dims) != 0) { fprintf(stderr, "failed to read %s\n", y_npy); return 1; }
-        if (read_f32_npy_dims(pf_npy, &pf, pf_dims) != 0) { fprintf(stderr, "failed to read %s\n", pf_npy); return 1; }
+        if (read_f32_npy_dims(y_npy, &y, y_dims) != 0) { fprintf(stderr, "failed to read %s\n", y_npy); { dcvc_pause_if_dblclick(); return 1; } }
+        if (read_f32_npy_dims(pf_npy, &pf, pf_dims) != 0) { fprintf(stderr, "failed to read %s\n", pf_npy); { dcvc_pause_if_dblclick(); return 1; } }
         n_ch = y_dims[1];
         H = y_dims[2];
         W = y_dims[3];
@@ -81,7 +82,7 @@ int main(int argc, char** argv)
 
     if (!y || !pf || !y_hat || !y_hat_dec) {
         fprintf(stderr, "oom\n");
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
 
     uint8_t* stream = NULL;
@@ -90,14 +91,14 @@ int main(int argc, char** argv)
     st = dcvc_cpu_ar_codec_encode_y(c, y, pf, H, W, &stream, &stream_size, y_hat);
     if (st != DCVC_CPU_OK) {
         fprintf(stderr, "encode failed: %s\n", dcvc_cpu_status_string(st));
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
     printf("encode OK: stream_size=%zu bytes\n", stream_size);
 
     st = dcvc_cpu_ar_codec_decode_y(c, pf, H, W, stream, stream_size, y_hat_dec);
     if (st != DCVC_CPU_OK) {
         fprintf(stderr, "decode failed: %s\n", dcvc_cpu_status_string(st));
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
     printf("decode OK\n");
 
@@ -110,12 +111,12 @@ int main(int argc, char** argv)
     printf("encode-decode y_hat max_diff=%.6f avg_diff=%.8f\n", max_diff, sum_diff / (n_ch * H * W));
     if (max_diff > 1e-4) {
         fprintf(stderr, "ERROR: y_hat mismatch too large\n");
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
 
     if (ref_npy) {
         int ref_dims[4] = {0};
-        if (read_f32_npy_dims(ref_npy, &y_ref, ref_dims) != 0) { fprintf(stderr, "failed to read %s\n", ref_npy); return 1; }
+        if (read_f32_npy_dims(ref_npy, &y_ref, ref_dims) != 0) { fprintf(stderr, "failed to read %s\n", ref_npy); { dcvc_pause_if_dblclick(); return 1; } }
         double ref_max = 0, ref_sum = 0;
         for (int i = 0; i < n_ch * H * W; i++) {
             double d = fabs((double)y_hat[i] - y_ref[i]);
@@ -128,5 +129,5 @@ int main(int argc, char** argv)
     free(y); free(pf); free(y_hat); free(y_hat_dec); free(stream); free(y_ref);
     dcvc_cpu_ar_codec_destroy(c);
     printf("PASS\n");
-    return 0;
+    { dcvc_pause_if_dblclick(); return 0; }
 }

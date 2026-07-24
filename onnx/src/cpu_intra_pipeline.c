@@ -197,25 +197,26 @@ DcvcCpuIntraPipeline* dcvc_cpu_intra_pipeline_create(const char* model_dir,
 
     char path[640];
     DcvcCpuStatus st = DCVC_CPU_OK;
+    const int use_gpu = dcvc_cpu_default_use_gpu();
 
     snprintf(path, sizeof(path), "%s/intra_analysis_standard.onnx", model_dir);
-    p->eng_analysis = dcvc_cpu_engine_create(path, 0, &st);
+    p->eng_analysis = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!p->eng_analysis) goto fail;
 
     snprintf(path, sizeof(path), "%s/intra_hyper_enc.onnx", model_dir);
-    p->eng_hyper_enc = dcvc_cpu_engine_create(path, 0, &st);
+    p->eng_hyper_enc = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!p->eng_hyper_enc) goto fail;
 
     snprintf(path, sizeof(path), "%s/hyper_dec.onnx", model_dir);
-    p->eng_hyper_dec = dcvc_cpu_engine_create(path, 0, &st);
+    p->eng_hyper_dec = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!p->eng_hyper_dec) goto fail;
 
     snprintf(path, sizeof(path), "%s/y_prior_fusion.onnx", model_dir);
-    p->eng_prior_fusion = dcvc_cpu_engine_create(path, 0, &st);
+    p->eng_prior_fusion = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!p->eng_prior_fusion) goto fail;
 
     snprintf(path, sizeof(path), "%s/intra_synthesis.onnx", model_dir);
-    p->eng_synthesis = dcvc_cpu_engine_create(path, 0, &st);
+    p->eng_synthesis = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!p->eng_synthesis) goto fail;
 
     p->ar_codec = dcvc_cpu_ar_codec_create(model_dir, p->N, &st);
@@ -424,6 +425,9 @@ DcvcCpuStatus dcvc_cpu_intra_pipeline_decode(DcvcCpuIntraPipeline* p,
                                 p->qp * p->ZC, zhw);
     int8_t* z_syms = NULL; size_t z_sym_n = 0;
     dcvc_rans_decoder_get_symbols(p->rans_dec, &z_syms, &z_sym_n);
+    if (dcvc_rans_decoder_has_error(p->rans_dec) ||
+        dcvc_rans_decoder_bytes_consumed(p->rans_dec) != z_len)
+        return DCVC_CPU_ERR_ENTROPY;
     int8_to_float(z_syms, p->z_hat, p->ZC * zhw);
 
     /* hyper_dec -> params -> prior_fusion */

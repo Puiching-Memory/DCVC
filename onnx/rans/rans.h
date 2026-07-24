@@ -160,6 +160,18 @@ public:
 
     virtual std::shared_ptr<std::vector<int8_t>> get_decoded_tensor();
 
+    /* ---- Runtime-protection API ----------------------------------------- *
+     * The decoder never crashes on a corrupt/desynchronized stream: every
+     * byte read is bounds-checked, and a desync (which causes the rANS state
+     * machine to consume the wrong number of bytes) sets the sticky error
+     * flag. Callers should check has_error() after decoding.                 */
+    bool has_error() const { return _error; }
+    /* Bytes consumed since set_stream() (== stream->size() for a valid,
+     * synchronized stream; any other value indicates desync).                */
+    size_t bytes_consumed() const {
+        return _stream ? static_cast<size_t>(_ptr8 - _stream->data()) : 0;
+    }
+
     virtual int add_cdf(const std::shared_ptr<std::vector<std::vector<int32_t>>> cdfs,
                         const std::shared_ptr<std::vector<int32_t>> cdfs_sizes,
                         const std::shared_ptr<std::vector<int32_t>> offsets);
@@ -168,6 +180,8 @@ public:
 private:
     RansState _rans;
     uint8_t* _ptr8;
+    uint8_t* _stream_end{nullptr};   /* one-past-the-end of the active stream  */
+    bool _error{false};              /* sticky: set on any overread / bad state */
     std::shared_ptr<std::vector<uint8_t>> _stream;
     std::shared_ptr<std::vector<int8_t>> m_decoded;
 

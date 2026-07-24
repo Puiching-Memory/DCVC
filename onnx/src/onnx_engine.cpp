@@ -1,4 +1,5 @@
 #include "onnx_engine.h"
+#include "fxp/ort_custom_ops.h"
 
 #ifdef __MINGW32__
 /* MinGW ships a minimal sal.h that omits several SAL annotations referenced
@@ -21,6 +22,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) */
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -40,6 +45,7 @@ const char* dcvc_cpu_status_string(DcvcCpuStatus st)
     case DCVC_CPU_ERR_ONNX: return "onnx";
     case DCVC_CPU_ERR_OOM: return "oom";
     case DCVC_CPU_ERR_UNSUPPORTED: return "unsupported";
+    case DCVC_CPU_ERR_ENTROPY: return "entropy_sync";
     default: return "unknown";
     }
 }
@@ -88,6 +94,11 @@ static int dcvc_requested_ep(int use_gpu)
     return (env && env[0]) ? atoi(env) : 0;
 }
 
+int dcvc_cpu_default_use_gpu(void)
+{
+    return dcvc_requested_ep(0);
+}
+
 static const char* dcvc_ep_name(int ep)
 {
     return ep == 2 ? "TensorrtExecutionProvider" : "CUDAExecutionProvider";
@@ -129,8 +140,33 @@ static int dcvc_try_append_gpu_ep(const OrtApi* api, OrtSessionOptions* opts, in
         if (!st) st = api->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cuda);
         if (cuda) api->ReleaseCUDAProviderOptions(cuda);
     }
-    if (st) { api->ReleaseStatus(st); return 0; }
+    if (st) {
+        fprintf(stderr, "dcvc_onnx: failed to append %s: %s\n",
+                dcvc_ep_name(ep), api->GetErrorMessage(st));
+        api->ReleaseStatus(st);
+        return 0;
+    }
     return 1;
+}
+
+int dcvc_cpu_cuda_ep_usable(void)
+{
+    const OrtApi* api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!api) return 0;
+    OrtEnv* env = nullptr;
+    OrtStatus* st = api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "dcvc_ep_probe", &env);
+    if (st) { api->ReleaseStatus(st); return 0; }
+    OrtSessionOptions* opts = nullptr;
+    st = api->CreateSessionOptions(&opts);
+    if (st) {
+        api->ReleaseStatus(st);
+        api->ReleaseEnv(env);
+        return 0;
+    }
+    int ok = dcvc_try_append_gpu_ep(api, opts, 1);
+    api->ReleaseSessionOptions(opts);
+    api->ReleaseEnv(env);
+    return ok;
 }
 
 /* Log the EP selection outcome once per process (a pipeline creates many
@@ -167,11 +203,43 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
-    st = api->SetIntraOpNumThreads(eng->opts, 0); /* 0 = default */
+    /* com.dcvc.FxpConv1x1 etc. — no-op for models that do not use them. */
+    if (dcvc_ort_register_custom_ops(api, eng->opts) != 0) {
+        fprintf(stderr, "dcvc_onnx: warning: custom op registration failed\n");
+    }
+
+    /* Intra-op threads feed Ort::KernelContext::ParallelFor inside FXP ops.
+     * FXP integer MAC partitioned by output channel is bit-exact for any
+     * thread count. Default: min(8, HW concurrency). Override with
+     * DCVC_ORT_INTRA_OP_THREADS (1 keeps the old single-thread behaviour). */
+    {
+        int intra = 8;
+        const char* e = getenv("DCVC_ORT_INTRA_OP_THREADS");
+        if (e && e[0]) {
+            intra = atoi(e);
+            if (intra < 1) intra = 1;
+            if (intra > 64) intra = 64;
+        } else {
+#ifdef _WIN32
+            SYSTEM_INFO si; GetSystemInfo(&si);
+            int hw = (int)si.dwNumberOfProcessors;
+#else
+            int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+            if (hw < 1) hw = 1;
+            intra = hw < 8 ? hw : 8;
+        }
+        st = api->SetIntraOpNumThreads(eng->opts, intra);
+    }
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
     st = api->SetInterOpNumThreads(eng->opts, 1);
+    check_status(api, st, out_st);
+    if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
+
+    /* Enable deterministic compute mode for cross-platform reproducibility. */
+    st = api->AddSessionConfigEntry(eng->opts, "session.use_deterministic_compute", "1");
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "console_pause.h"
 
 static const char DCVS_MAGIC[4] = {'D','C','V','S'};  /* Sequence */
 static const char* g_model_dir_override = NULL;
@@ -292,8 +293,8 @@ int main(int argc, char** argv) {
     }
     *out = NULL; argc = new_argc; argv[argc] = NULL;
 
-    if (argc > 1 && strcmp(argv[1], "--encode") == 0) return mode_encode(argc, argv);
-    if (argc > 1 && strcmp(argv[1], "--decode") == 0) return mode_decode(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "--encode") == 0) { dcvc_pause_if_dblclick(); return mode_encode(argc, argv); }
+    if (argc > 1 && strcmp(argv[1], "--decode") == 0) { dcvc_pause_if_dblclick(); return mode_decode(argc, argv); }
     if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         printf("Usage:\n");
         printf("  test_cpu_inter[.exe] [N] [H] [W] [qp_i] [qp_p]\n");
@@ -304,7 +305,7 @@ int main(int argc, char** argv) {
         printf("  test_cpu_inter[.exe] --decode <bin> <npy>\n");
         printf("      Decode a self-describing bitstream to a (N,3,H,W) float32 npy.\n");
         printf("\n  --model-dir <dir> is optional in all modes (auto-detected otherwise).\n");
-        return 0;
+        { dcvc_pause_if_dblclick(); return 0; }
     }
-    return mode_roundtrip(argc, argv);
+    { dcvc_pause_if_dblclick(); return mode_roundtrip(argc, argv); }
 }

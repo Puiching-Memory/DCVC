@@ -267,4 +267,39 @@ void dcvc_rans_decoder_reset_cdf(DcvcRansDecoder* dec)
     dec->dec1->empty_cdf_buffer();
 }
 
+int dcvc_rans_decoder_has_error(DcvcRansDecoder* dec)
+{
+    if (!dec) return 0;
+    /* In the split (use_two) layout either half failing means the frame is
+     * unrecoverable. */
+    return (dec->dec0->has_error() || (dec->use_two && dec->dec1->has_error())) ? 1 : 0;
+}
+
+size_t dcvc_rans_decoder_bytes_consumed(DcvcRansDecoder* dec)
+{
+    if (!dec) return 0;
+    return dec->dec0->bytes_consumed();
+}
+
+/* Lazily-built CRC-32 table (IEEE 802.3). Thread-safe on first init. */
+uint32_t dcvc_crc32(const void* data, size_t len)
+{
+    static uint32_t table[256];
+    static bool inited = false;
+    if (!inited) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        inited = true;
+    }
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++)
+        crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
 }  // extern "C"

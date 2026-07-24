@@ -14,7 +14,8 @@ typedef enum DcvcCpuStatus {
     DCVC_CPU_ERR_IO = 2,
     DCVC_CPU_ERR_ONNX = 3,
     DCVC_CPU_ERR_OOM = 4,
-    DCVC_CPU_ERR_UNSUPPORTED = 5
+    DCVC_CPU_ERR_UNSUPPORTED = 5,
+    DCVC_CPU_ERR_ENTROPY = 6   /* rANS stream corrupt/desynced */
 } DcvcCpuStatus;
 
 /* Generic 4D tensor view. For CPU backend both pointers are host memory. */
@@ -34,6 +35,12 @@ typedef struct DcvcCpuEngine DcvcCpuEngine;
  * DCVC_GPU_DEVICE selects the GPU device index (default 0). */
 DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCpuStatus* out_st);
 void dcvc_cpu_engine_destroy(DcvcCpuEngine* eng);
+
+/* Resolve DCVC_USE_GPU env (0/1/2). Used by pipelines so one env var flips all nets. */
+int dcvc_cpu_default_use_gpu(void);
+
+/* 1 if CUDA EP can be appended in this ORT build + runtime (cuDNN present). */
+int dcvc_cpu_cuda_ep_usable(void);
 
 /* Execute one inference with NCHW inputs/outputs.
  * Inputs and outputs are copied from/into the provided views.

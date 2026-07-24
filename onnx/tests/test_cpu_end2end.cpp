@@ -14,11 +14,13 @@
 #include "model_dir.h"
 #include "npy_reader.h"
 #include "onnx_engine.h"
+#include "rans_c.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "console_pause.h"
 
 /* Self-describing container for the codec bitstream (little-endian).
  *   offset 0: magic "DCV1"
@@ -26,6 +28,9 @@
  *   offset 8: W   (uint32)
  *   offset 12: qp (uint32)
  *   offset 16: codec bitstream ([z_len:u32][z_stream][y_stream])
+ *   trailer (optional, DCVC_CRC=1): CRC-32 over offset 16..end-4 (uint32, LE)
+ *      Guards the entropy stream against in-transit corruption; the rANS
+ *      state machine itself cannot detect a flipped bit in the bytestream.
  */
 static const char DCV_MAGIC[4] = {'D', 'C', 'V', '1'};
 
@@ -156,13 +161,19 @@ static int mode_encode(int argc, char** argv)
 
     /* Wrap the codec bitstream in the self-describing container. */
     uint32_t hu = (uint32_t)H, wu = (uint32_t)W, qu = (uint32_t)qp;
-    size_t total = 16 + stream_size;
+    int with_crc = getenv("DCVC_CRC") && atoi(getenv("DCVC_CRC")) != 0;
+    size_t crc_bytes = with_crc ? 4 : 0;
+    size_t total = 16 + stream_size + crc_bytes;
     uint8_t* buf = (uint8_t*)malloc(total);
     memcpy(buf + 0, DCV_MAGIC, 4);
     memcpy(buf + 4, &hu, 4);
     memcpy(buf + 8, &wu, 4);
     memcpy(buf + 12, &qu, 4);
     if (stream_size) memcpy(buf + 16, stream, stream_size);
+    if (with_crc) {
+        uint32_t crc = dcvc_crc32(buf + 16, stream_size);
+        memcpy(buf + 16 + stream_size, &crc, 4);
+    }
 
     if (write_raw_file(bin, buf, total) != 0) {
         fprintf(stderr, "failed to write %s\n", bin);
@@ -210,6 +221,24 @@ static int mode_decode(int argc, char** argv)
     int H = (int)hu, W = (int)wu, qp = (int)qu;
     const uint8_t* stream = (const uint8_t*)raw + 16;
     size_t stream_size = raw_size - 16;
+    /* Optional CRC-32 trailer: if the container is large enough and the
+     * decoder is asked (DCVC_CRC=1) to expect it, verify before decoding. */
+    int with_crc = getenv("DCVC_CRC") && atoi(getenv("DCVC_CRC")) != 0;
+    if (with_crc) {
+        if (stream_size < 4) {
+            fprintf(stderr, "%s: container too small for CRC trailer\n", bin);
+            return 1;
+        }
+        uint32_t stored = 0;
+        memcpy(&stored, (const uint8_t*)raw + raw_size - 4, 4);
+        uint32_t calc = dcvc_crc32(stream, stream_size - 4);
+        if (stored != calc) {
+            fprintf(stderr, "%s: bitstream CRC mismatch (stored=%08x calc=%08x)\n",
+                    bin, stored, calc);
+            return 1;
+        }
+        stream_size -= 4;
+    }
 
     const char* model_dir = resolve_model_dir("intra_analysis_standard.onnx");
     printf("DECODE: model_dir=%s H=%d W=%d qp=%d stream=%zu bytes <- %s\n",
@@ -390,8 +419,8 @@ int main(int argc, char** argv)
     argc = new_argc;
     argv[argc] = NULL;
 
-    if (argc > 1 && strcmp(argv[1], "--encode") == 0) return mode_encode(argc, argv);
-    if (argc > 1 && strcmp(argv[1], "--decode") == 0) return mode_decode(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "--encode") == 0) { dcvc_pause_if_dblclick(); return mode_encode(argc, argv); }
+    if (argc > 1 && strcmp(argv[1], "--decode") == 0) { dcvc_pause_if_dblclick(); return mode_decode(argc, argv); }
     if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         printf("Usage:\n");
         printf("  test_cpu_end2end [model_dir] [H] [W] [qp] [x.npy] [out.npy] [ref.npy]\n");
@@ -402,7 +431,7 @@ int main(int argc, char** argv)
         printf("  test_cpu_end2end --model-dir <dir> --decode <bin> [ref.npy]\n");
         printf("      Decode <bin>; write <bin>.dec.npy and optionally compare to ref.npy.\n");
         printf("\n  --model-dir <dir> is optional in all modes (auto-detected otherwise).\n");
-        return 0;
+        { dcvc_pause_if_dblclick(); return 0; }
     }
-    return mode_roundtrip(argc, argv);
+    { dcvc_pause_if_dblclick(); return mode_roundtrip(argc, argv); }
 }

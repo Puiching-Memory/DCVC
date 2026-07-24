@@ -11,6 +11,7 @@
 #include "cpu_inter_pipeline.h"
 #include "npy_reader.h"
 #include "rans_c.h"
+#include "fxp/fxp_scale_index.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -64,6 +65,7 @@ struct DcvcCpuInterPipeline {
 
     float scale_min, scale_max, log_scale_min, log_step_recip;
     int scale_level;
+    float skip_thres;  /* adaptive entropy: force-zero symbols with scale <= this */
 
     float *q_enc, *q_dec, *q_feat, *q_recon;   /* [DCH], [DCH], [DCH], [RCH] */
 
@@ -147,23 +149,14 @@ static void sp2x(const float* x, float* out, int n)
 static void build_index_dec(const float* s, uint8_t* out,
                             float smin, float smax, float lmin, float lrecip, int n)
 {
-    for (int i = 0; i < n; i++) {
-        float v = s[i]; if (v < smin) v = smin; if (v > smax) v = smax;
-        int idx = (int)floorf((logf(v) - lmin) * lrecip);
-        if (idx < 0) idx = 0; if (idx > 127) idx = 127;
-        out[i] = (uint8_t)idx;
-    }
+    (void)smin; (void)smax; (void)lmin; (void)lrecip;
+    dcvc_build_index_dec_i(s, out, n);
 }
 static void build_index_enc(const float* sym, const float* s, int16_t* out,
                             float smin, float smax, float lmin, float lrecip, int n)
 {
-    for (int i = 0; i < n; i++) {
-        float v = s[i]; if (v < smin) v = smin; if (v > smax) v = smax;
-        int idx = (int)floorf((logf(v) - lmin) * lrecip);
-        if (idx < 0) idx = 0; if (idx > 127) idx = 127;
-        int sy = (int)roundf(sym[i]);
-        out[i] = (int16_t)((sy << 8) + idx);
-    }
+    (void)smin; (void)smax; (void)lmin; (void)lrecip;
+    dcvc_build_index_enc_i(sym, s, out, n);
 }
 /* pixel_unshuffle(x[3,H,W], out[192,fH,fW], factor 8) */
 static void pixel_unshuffle_8(const float* x, float* out, int H, int W, int fH, int fW)
@@ -298,12 +291,13 @@ static void init_scale_table(DcvcCpuInterPipeline* p)
     p->log_scale_min = logf(p->scale_min);
     float log_max = logf(p->scale_max);
     p->log_step_recip = (float)(p->scale_level - 1) / (log_max - p->log_scale_min);
+    p->skip_thres = 0.0f;  /* disabled by default; enable via DCVC_SKIP_THRES env */
 }
 
 /* ---------- create / destroy ---------- */
 #define LOAD_ENG(field, fname) do { \
     snprintf(path, sizeof(path), "%s/" fname, model_dir); \
-    p->field = dcvc_cpu_engine_create(path, 0, &st); \
+    p->field = dcvc_cpu_engine_create(path, dcvc_cpu_default_use_gpu(), &st); \
     if (!p->field) goto fail; } while (0)
 #define LOAD_NPY(np, fname) do { \
     snprintf(path, sizeof(path), "%s/" fname, model_dir); \
@@ -397,6 +391,12 @@ DcvcCpuInterPipeline* dcvc_cpu_inter_pipeline_create(const char* model_dir,
         if (!all[i]) { st = DCVC_CPU_ERR_OOM; goto fail; }
     build_masks_2x(p->masks[0], p->masks[1], p->yH, p->yW);
 
+    /* Optional skip_thres from environment (adaptive entropy coding). */
+    {
+        const char* st_env = getenv("DCVC_SKIP_THRES");
+        if (st_env) { p->skip_thres = strtof(st_env, NULL); }
+    }
+
     if (out_st) *out_st = DCVC_CPU_OK;
     return p;
 fail:
@@ -475,6 +475,8 @@ static DcvcCpuStatus prior_2x_decode(DcvcCpuInterPipeline* p)
     dcvc_rans_decoder_decode_y(p->rans_dec, p->indexes, hw64, p->g_cdf_idx);
     int8_t* syms = NULL; size_t symn = 0;
     dcvc_rans_decoder_get_symbols(p->rans_dec, &syms, &symn);
+    if (dcvc_rans_decoder_has_error(p->rans_dec))
+        return DCVC_CPU_ERR_ENTROPY;
     /* restore_y_2x_with_cat_after: y_hat_0=(cat(yq,yq)+means)*mask0 ; cat_params=cat(y_hat_0,params) */
     for (int i = 0; i < YCH * yHW; i++) {
         float yq = (float)syms[i % hw64];
@@ -498,6 +500,8 @@ static DcvcCpuStatus prior_2x_decode(DcvcCpuInterPipeline* p)
                     p->log_scale_min, p->log_step_recip, hw64);
     dcvc_rans_decoder_decode_y(p->rans_dec, p->indexes, hw64, p->g_cdf_idx);
     dcvc_rans_decoder_get_symbols(p->rans_dec, &syms, &symn);
+    if (dcvc_rans_decoder_has_error(p->rans_dec))
+        return DCVC_CPU_ERR_ENTROPY;
     for (int i = 0; i < YCH * yHW; i++) {
         float yq = (float)syms[i % hw64];
         p->yhat_acc[i] += (yq + means1[i]) * mask1[i];
@@ -531,9 +535,11 @@ static DcvcCpuStatus prior_2x_encode(DcvcCpuInterPipeline* p)
         float mh = p->means[i] * fm;
         float q = roundf((p->y[i] - mh) * fm);
         if (q > 127.0f) q = 127.0f; if (q < -128.0f) q = -128.0f;
+        float s_hat = p->scales[i] * fm;     /* s_hat_0 */
+        if (s_hat <= p->skip_thres) q = 0.0f;   /* force-zero: skip rANS */
         p->yq_full[i] = q;
         p->yhat_acc[i] = q + mh;                /* y_hat_0 */
-        p->scl_mask[i] = p->scales[i] * fm;     /* s_hat_0 */
+        p->scl_mask[i] = s_hat;
     }
     sp2x(p->yq_full, p->yq_w, hw64);
     sp2x(p->scl_mask, p->sr, hw64);
@@ -557,9 +563,11 @@ static DcvcCpuStatus prior_2x_encode(DcvcCpuInterPipeline* p)
         float mh = means1[i] * fm;
         float q = roundf((p->y[i] - mh) * fm);
         if (q > 127.0f) q = 127.0f; if (q < -128.0f) q = -128.0f;
+        float s_hat = scales1[i] * fm;
+        if (s_hat <= p->skip_thres) q = 0.0f;   /* force-zero: skip rANS */
         p->yq_full[i] = q;
         p->yhat_acc[i] += q + mh;               /* accumulate y_hat_1 */
-        p->scl_mask[i] = scales1[i] * fm;
+        p->scl_mask[i] = s_hat;
     }
     sp2x(p->yq_full, p->yq_w, hw64);
     sp2x(p->scl_mask, p->sr, hw64);
@@ -686,6 +694,8 @@ DcvcCpuStatus dcvc_cpu_inter_pipeline_decode(DcvcCpuInterPipeline* p,
     dcvc_rans_decoder_decode_z(p->rans_dec, ZCH * zHW, p->z_cdf_idx, p->qp * ZCH, zHW);
     int8_t* zsyms = NULL; size_t zn = 0;
     dcvc_rans_decoder_get_symbols(p->rans_dec, &zsyms, &zn);
+    if (dcvc_rans_decoder_has_error(p->rans_dec))
+        return DCVC_CPU_ERR_ENTROPY;
     int8_to_float(zsyms, p->z_hat, ZCH * zHW);
 
     /* params = prior_params(z_hat, ctx_t) */
@@ -698,6 +708,9 @@ DcvcCpuStatus dcvc_cpu_inter_pipeline_decode(DcvcCpuInterPipeline* p,
                         dcvc_npy_i32(&p->glen), dcvc_npy_i32(&p->goff));
     st = prior_2x_decode(p);
     if (st != DCVC_CPU_OK) return st;
+    /* z and y share one stream; a synchronized decode consumes it exactly. */
+    if (dcvc_rans_decoder_bytes_consumed(p->rans_dec) != stream_size)
+        return DCVC_CPU_ERR_ENTROPY;
 
     /* Reconstruct and convert YCbCr output back to RGB before cropping. */
     st = reconstruct(p, p->x_hat);

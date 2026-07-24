@@ -6,6 +6,7 @@
 #include "npy_reader.h"
 #include "onnx_engine.h"
 #include "rans_c.h"
+#include "fxp/fxp_scale_index.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -53,6 +54,7 @@ struct DcvcCpuArCodec {
     int g_cdf_idx;
 
     float scale_min, scale_max, log_scale_min, log_step_recip;
+    float skip_thres;
 };
 
 static const int k_mask_pattern[4][4] = {
@@ -166,7 +168,7 @@ static void process_mask_yq(const float* y, const float* scales, const float* me
         float fm = mask[i];
         float means_hat = means[i] * fm;
         float q = roundf((y[i] - means_hat) * fm);
-        if (force_zero_thres > 0.0f && scales[i] * fm > force_zero_thres) q = 0.0f;
+        if (force_zero_thres > 0.0f && scales[i] * fm <= force_zero_thres) q = 0.0f;
         if (q > 127.0f) q = 127.0f;
         if (q < -128.0f) q = -128.0f;
         yq[i] = q;
@@ -190,33 +192,16 @@ static void build_index_dec(const float* scales, uint8_t* out,
                             float scale_min, float scale_max,
                             float log_scale_min, float log_step_recip, int n)
 {
-    for (int i = 0; i < n; i++) {
-        float s = scales[i];
-        if (s < scale_min) s = scale_min;
-        if (s > scale_max) s = scale_max;
-        float v = (logf(s) - log_scale_min) * log_step_recip;
-        int idx = (int)floorf(v);
-        if (idx < 0) idx = 0;
-        if (idx > 127) idx = 127;
-        out[i] = (uint8_t)idx;
-    }
+    (void)scale_min; (void)scale_max; (void)log_scale_min; (void)log_step_recip;
+    dcvc_build_index_dec_i(scales, out, n);
 }
 
 static void build_index_enc(const float* symbols, const float* scales, int16_t* out,
                             float scale_min, float scale_max,
                             float log_scale_min, float log_step_recip, int n)
 {
-    for (int i = 0; i < n; i++) {
-        float s = scales[i];
-        if (s < scale_min) s = scale_min;
-        if (s > scale_max) s = scale_max;
-        float v = (logf(s) - log_scale_min) * log_step_recip;
-        int idx = (int)floorf(v);
-        if (idx < 0) idx = 0;
-        if (idx > 127) idx = 127;
-        int sym = (int)roundf(symbols[i]);
-        out[i] = (int16_t)((sym << 8) + idx);
-    }
+    (void)scale_min; (void)scale_max; (void)log_scale_min; (void)log_step_recip;
+    dcvc_build_index_enc_i(symbols, scales, out, n);
 }
 
 static void int8_to_fp32(const int8_t* in, float* out, int n)
@@ -272,21 +257,26 @@ DcvcCpuArCodec* dcvc_cpu_ar_codec_create(const char* model_dir, int n_ch,
     c->log_scale_min = logf(c->scale_min);
     c->log_step_recip = 1.0f / ((logf(c->scale_max) - c->log_scale_min) / 127.0f);
 
+    /* Optional skip_thres from environment (adaptive entropy coding). */
+    c->skip_thres = 0.0f;
+    { const char* e = getenv("DCVC_SKIP_THRES"); if (e) c->skip_thres = strtof(e, NULL); }
+
     char path[640];
     DcvcCpuStatus st = DCVC_CPU_OK;
+    const int use_gpu = dcvc_cpu_default_use_gpu();
 
     snprintf(path, sizeof(path), "%s/y_spatial_prior_reduction.onnx", model_dir);
-    c->eng_reduction = dcvc_cpu_engine_create(path, 0, &st);
+    c->eng_reduction = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!c->eng_reduction) goto fail;
 
     for (int i = 1; i <= 3; i++) {
         snprintf(path, sizeof(path), "%s/y_spatial_prior_adaptor_%d.onnx", model_dir, i);
-        c->eng_adaptor[i] = dcvc_cpu_engine_create(path, 0, &st);
+        c->eng_adaptor[i] = dcvc_cpu_engine_create(path, use_gpu, &st);
         if (!c->eng_adaptor[i]) goto fail;
     }
 
     snprintf(path, sizeof(path), "%s/y_spatial_prior.onnx", model_dir);
-    c->eng_spatial_prior = dcvc_cpu_engine_create(path, 0, &st);
+    c->eng_spatial_prior = dcvc_cpu_engine_create(path, use_gpu, &st);
     if (!c->eng_spatial_prior) goto fail;
 
     snprintf(path, sizeof(path), "%s/gaussian_cdf.npy", model_dir);
@@ -365,7 +355,7 @@ DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
 
         float* mask = ws->masks[round];
 
-        process_mask_yq(ws->yq_full, curr_scales, curr_means, mask, ws->yq, nc * hw, -1.0f);
+        process_mask_yq(ws->yq_full, curr_scales, curr_means, mask, ws->yq, nc * hw, c->skip_thres);
         sp4x(ws->yq, ws->yq_w, r * hw);
 
         for (int i = 0; i < nc * hw; i++) ws->smask[i] = curr_scales[i] * mask[i];
@@ -441,10 +431,23 @@ DcvcCpuStatus dcvc_cpu_ar_codec_decode_y(DcvcCpuArCodec* c,
         int8_t* syms = NULL; size_t sym_n = 0;
         dcvc_rans_decoder_get_symbols(c->rans_dec, &syms, &sym_n);
 
+        /* Runtime protection: a desynchronized/corrupt rANS stream sets the
+         * sticky error flag. Bail out before feeding garbage symbols into the
+         * autoregressive loop (which would otherwise amplify the damage). */
+        if (dcvc_rans_decoder_has_error(c->rans_dec))
+            return DCVC_CPU_ERR_ENTROPY;
+
         int8_to_fp32(syms, ws->yq_w, r * hw);
         restore_y_4x(ws->yq_w, curr_means, mask, ws->yhat_step, r * hw, nc * hw);
         add_inplace(ws->yhat, ws->yhat_step, nc * hw);
     }
+
+    /* Deterministic-state guarantee: a valid, synchronized decode consumes
+     * exactly the bytes the encoder produced. Any mismatch means the two sides
+     * diverged (the most likely cause is a cross-device FP difference in the
+     * entropy-parameter network selecting a different CDF). */
+    if (dcvc_rans_decoder_bytes_consumed(c->rans_dec) != stream_size)
+        return DCVC_CPU_ERR_ENTROPY;
 
     broadcast_mul(ws->yhat, ws->qdec, ws->yhat, nc, hw);
     memcpy(y_hat_out, ws->yhat, nc * hw * sizeof(float));

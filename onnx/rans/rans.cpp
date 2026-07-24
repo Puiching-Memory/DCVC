@@ -57,6 +57,22 @@ inline uint32_t RansDecGetBits(RansState& r, uint8_t*& ptr)
     return val;
 }
 
+// Bounds-checked bypass-bit reader (the bypass_precision constant lives in
+// this translation unit). Returns false on stream overread.
+inline bool RansDecGetBitsSafe(RansState& r, uint8_t*& ptr, const uint8_t* end, uint32_t& out_val)
+{
+    out_val = r & ((1u << bypass_precision) - 1);
+
+    /* Re-normalize */
+    r = r >> bypass_precision;
+    if (r < RANS_BYTE_L) {
+        if (ptr >= end) return false;
+        r = (r << 8) | *ptr++;
+    }
+
+    return true;
+}
+
 RansEncoderLib::RansEncoderLib()
 {
     _stream = std::make_shared<std::vector<uint8_t>>();
@@ -336,7 +352,12 @@ void RansDecoderLib::set_stream(const std::shared_ptr<std::vector<uint8_t>> enco
 {
     _stream = encoded;
     _ptr8 = (uint8_t*)(_stream->data());
-    RansDecInit(_rans, _ptr8);
+    _stream_end = _ptr8 + _stream->size();
+    _error = false;
+    if (!RansDecInitSafe(_rans, _ptr8, _stream_end)) {
+        /* stream too short to even hold the 32-bit rANS state */
+        _error = true;
+    }
 }
 
 int RansDecoderLib::add_cdf(const std::shared_ptr<std::vector<std::vector<int32_t>>> cdfs,
@@ -359,31 +380,54 @@ void RansDecoderLib::empty_cdf_buffer()
 FORCE_INLINE int8_t RansDecoderLib::decode_one_symbol(const int32_t* cdf, const int32_t cdf_size,
                                                       const int32_t offset)
 {
+    /* Once the stream has desynchronized, further decoding only produces
+     * garbage; short-circuit to avoid compounding the damage. */
+    if (_error) return 0;
+
     const int32_t max_value = cdf_size - 2;
     const int32_t cum_freq = static_cast<int32_t>(RansDecGet(_rans));
 
+    /* Bounded CDF scan: previously `while (cdf[s++] <= cum_freq)` had no upper
+     * bound, so a corrupt cum_freq could read past the table. The last entry
+     * cdf[cdf_size-1] == 2^SCALE_BITS is always > any valid cum_freq, so a
+     * synchronized stream never reaches s == cdf_size; reaching it proves the
+     * state is corrupt. */
     int s = 1;
-    while (cdf[s++] <= cum_freq) {
+    while (s < cdf_size && cdf[s] <= cum_freq) {
+        s++;
     }
-    s -= 2;
+    if (s >= cdf_size) {
+        _error = true;
+        return 0;
+    }
+    const int32_t sym = s - 1;
 
-    RansDecAdvance(_rans, _ptr8, cdf[s], cdf[s + 1] - cdf[s]);
+    if (!RansDecAdvanceSafe(_rans, _ptr8, _stream_end, cdf[sym], cdf[sym + 1] - cdf[sym])) {
+        _error = true;
+        return 0;
+    }
 
-    int32_t value = static_cast<int32_t>(s);
+    int32_t value = sym;
 
     if (value == max_value) {
-        /* Bypass decoding mode */
-        int32_t val = RansDecGetBits(_rans, _ptr8);
+        /* Bypass decoding mode: the loop counts are data-dependent, so a
+         * desync can request an unbounded number of bypass bits. Every read
+         * is bounds-checked and aborts on overread. */
+        uint32_t bits = 0;
+        if (!RansDecGetBitsSafe(_rans, _ptr8, _stream_end, bits)) { _error = true; return 0; }
+        int32_t val = static_cast<int32_t>(bits);
         int32_t n_bypass = val;
 
         while (val == max_bypass_val) {
-            val = RansDecGetBits(_rans, _ptr8);
+            if (!RansDecGetBitsSafe(_rans, _ptr8, _stream_end, bits)) { _error = true; return 0; }
+            val = static_cast<int32_t>(bits);
             n_bypass += val;
         }
 
         int32_t raw_val = 0;
         for (int j = 0; j < n_bypass; ++j) {
-            val = RansDecGetBits(_rans, _ptr8);
+            if (!RansDecGetBitsSafe(_rans, _ptr8, _stream_end, bits)) { _error = true; return 0; }
+            val = static_cast<int32_t>(bits);
             raw_val |= val << (j * bypass_precision);
         }
         value = raw_val >> 1;

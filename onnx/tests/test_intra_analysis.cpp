@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "console_pause.h"
 
 /* Load a .npy and convert to FP32 regardless of whether it was f16 or f32.
  * Returns malloc'd buffer (caller frees) or NULL on failure. dims[0..3] out. */
@@ -50,7 +51,7 @@ int main(int argc, char** argv)
     DcvcCpuEngine* eng = dcvc_cpu_engine_create(model, 0, &st);
     if (!eng) {
         fprintf(stderr, "create: %s\n", dcvc_cpu_status_string(st));
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
 
     int in_dims[4] = {1, 3, 256, 256};
@@ -88,7 +89,7 @@ int main(int argc, char** argv)
     st = dcvc_cpu_engine_run(eng, inputs, 2, &output, 1);
     if (st != DCVC_CPU_OK) {
         fprintf(stderr, "run: %s\n", dcvc_cpu_status_string(st));
-        return 1;
+        { dcvc_pause_if_dblclick(); return 1; }
     }
 
     printf("intra_analysis OK: input %dx%dx%dx%d + quant %dx%dx%dx%d -> output %dx%dx%dx%d\n",
@@ -117,5 +118,5 @@ int main(int argc, char** argv)
 
     free(in_fp32); free(out_ref); free(quant_fp32); free(out_buf);
     dcvc_cpu_engine_destroy(eng);
-    return 0;
+    { dcvc_pause_if_dblclick(); return 0; }
 }

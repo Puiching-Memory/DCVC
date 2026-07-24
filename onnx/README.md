@@ -102,9 +102,28 @@ measure against the CPU build before committing to it.
 
 Cross-device caution: mixing execution providers between encoder and decoder
 (e.g. CPU encode, GPU decode) can desync the rANS entropy coder via ULP-level
-FP differences in the entropy-parameter networks. See
-[docs/entropy_sync_ptq_report.md](docs/entropy_sync_ptq_report.md) for the
-full analysis and the INT8/INT16 quantization experiments.
+FP differences in the entropy-parameter networks when those nets are FP32.
+The default path uses **fixed-point** `com.dcvc` ops so CPU encode/decode stays
+cross-OS bit-exact — see
+[docs/fxp_cross_platform_rans.md](docs/fxp_cross_platform_rans.md).
+Background and failed INT8/INT16 PTQ attempts:
+[docs/entropy_sync_ptq_report.md](docs/entropy_sync_ptq_report.md).
+
+Fixed-point entropy nets (ORT custom ops) — now the DEFAULT in `onnx/models/`.
+Intra + inter entropy nets (and key inter recon/feature nets) use
+`com.dcvc::FxpConv` + `com.dcvc::FxpWsRelu` (int16 act / int16 weights, LUT
+nonlinear). Integer arithmetic is associative, so the entropy path is
+cross-platform bit-exact by construction. CDF index selection uses a shared
+integer rule (`src/fxp/fxp_scale_index.c`): float→Q18→Q12→128-level scale-table
+lookup — no runtime `logf`/`floorf`. Encode and decode both call this path.
+(The FP32 nets are in `models_fp32/` for RD comparison only.)
+```bash
+# Regenerate the fxp nets into a directory (real-content activation calibration):
+uv run python python/fxp_export_entropy_nets.py --calib-dir <calib> --out-dir models_fxp
+cmake --build build --target test_fxp_scale_index test_cpu_end2end
+./build/test_fxp_scale_index
+./build/test_cpu_end2end models_fxp 128 128 32
+```
 
 ### Cross-compile Windows from Linux (MinGW-w64)
 
@@ -126,8 +145,30 @@ DCVC_ORT_URL_BASE=https://gh-proxy.com/ bash onnx/scripts/build_windows_cross.sh
 The MinGW exes statically link the C/C++/pthread runtimes (`-static`), so the
 package only needs `onnxruntime.dll` + the models — no MinGW runtime DLLs to
 ship. The produced `.exe` files are real PE binaries that run on any Windows x64
-machine (and can be verified on the Linux host with `wine ./test_cpu_end2end.exe
-../models 256 256 32`).
+machine. To assemble a ready-to-distribute Windows folder from the cross build:
+
+```bash
+cmake --build onnx/build-mingw --target dcvc_package
+# -> onnx/dist/dcvc_onnx_codec/*.exe + onnxruntime.dll + models
+```
+
+Zip `onnx/dist/dcvc_onnx_codec/` and ship it — no compiler is needed on the
+Windows side.
+
+> **⚠️ Wine is a smoke test, not a cross-platform proof.** A quick sanity check
+> on the Linux host with `wine ./test_cpu_end2end.exe ../models 256 256 32` (and
+> even a Wine cross-decode round-trip) is useful — it confirms the PE links
+> correctly, `onnxruntime.dll` loads, and the logic is self-consistent. But Wine
+> is a *Windows API compatibility layer, not a CPU emulator*: the `.exe`'s
+> x86-64 instructions execute natively on the same Linux CPU, so it does **not**
+> exercise the real cross-platform risk surface — a different OS, a different
+> compiler (the production Windows path is MSVC via `build_windows.ps1`, not
+> MinGW), a different CPU microarchitecture, or a different ORT build. A Wine
+> round-trip of `max_diff=0` only says "the binary is not broken"; it says
+> nothing about whether MSVC-built Windows binaries will match GCC-built Linux
+> binaries. For a genuine cross-platform guarantee, run the `--encode`/`--decode`
+> interop test below on two *physical* machines with different OSes (see
+> *Cross-platform interoperability test*).
 
 ## Package a runnable folder
 
@@ -149,6 +190,19 @@ test_cpu_end2end.exe . 256 256 32        # Windows
 ```
 `H` and `W` may be **any positive integers** -- the codec pads to the next
 multiple of 64 internally and crops back (see *Dynamic resolution* below).
+
+### Double-click on Windows (console stays open)
+
+The Windows test `.exe`s detect when they were launched by **double-click**
+(parent process is `explorer.exe`) and pause with `[Press Enter to exit]` before
+returning, so the console window does not vanish and the output can be
+read/copied. When run from a terminal, a script, or with redirected stdin/pipe,
+they return immediately and never block automation.
+
+- Set `DCVC_FORCE_PAUSE=1` to force the pause even from a terminal (handy for
+  capturing output). Redirection/pipes are always skipped to avoid hanging.
+- This logic (`onnx/tests/console_pause.h`) is a no-op on Linux/macOS.
+
 
 ## I-frame + P-frame (inter-frame prediction)
 
@@ -233,6 +287,13 @@ copies the entropy CDF tables into `models/`.
 
 ## Runtime model files (`models/`)
 
+`onnx/models/` ships the **fixed-point (fxp) entropy nets by default**: the 7
+entropy-parameter networks use integer arithmetic (`com.dcvc` custom ops), which
+is cross-platform bit-exact by construction. This is the path real cross-platform
+testing is done against. The original FP32 entropy nets are kept in
+`onnx/models_fp32/` for RD comparison only — they can desync across MSVC/GCC on
+real video (see `docs/entropy_sync_ptq_report.md`).
+
 | File | Purpose |
 |------|---------|
 | `intra_analysis_standard.onnx` | image → latent `y` |
@@ -246,9 +307,25 @@ copies the entropy CDF tables into `models/`.
 
 ## Cross-platform interoperability test
 
-`test_cpu_end2end` supports `--encode`/`--decode` modes that persist the codec
-bitstream to a self-describing file (`DCV1` magic + H + W + qp + stream), so you
-can encode on one OS and decode on another to verify the bitstream is portable.
+> This is the **real** cross-platform test — unlike the Wine smoke check above,
+> it requires two *physical* machines of different OSes (Linux and Windows) and
+> is the only way to validate the actual GCC-vs-MSVC and Linux-vs-Windows
+> floating-point differences. Run it with MSVC-built Windows binaries
+> (`build_windows.ps1`, not the MinGW cross build) for a production-faithful
+> result. The `max_diff=0` measurement in the table below came from this path
+> (GCC Linux ORT vs MSVC Windows ORT), not from Wine.
+
+Because `onnx/models/` now ships the **fixed-point entropy nets by default**,
+the entropy path is integer-arithmetic (bit-exact by construction), which is
+what makes cross-platform encode/decode reliable. (With the FP32 nets in
+`models_fp32/`, real cross-platform P-frame sequences can desync — confirmed by
+testing: an MSVC-encoded 10-frame P sequence fails to decode on GCC at frame 3
+with `entropy_sync`.)
+
+`test_cpu_end2end` (I-frame) and `test_cpu_inter` (I+P sequence) both support
+`--encode`/`--decode` with self-describing containers (`DCV1` for a single
+frame, `DCVS` for a sequence), so you can encode on one OS and decode on
+another to verify the bitstream is portable.
 
 ```bash
 # 1. On Windows: encode a frame -> frame.bin (+ frame.bin.enc.npy reconstruction)

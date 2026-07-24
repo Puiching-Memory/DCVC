@@ -42,6 +42,23 @@ void dcvc_rans_decoder_decode_z(DcvcRansDecoder* dec, int total_size, int cdf_gr
 int dcvc_rans_decoder_get_symbols(DcvcRansDecoder* dec, int8_t** out, size_t* out_n);
 void dcvc_rans_decoder_reset_cdf(DcvcRansDecoder* dec);
 
+/* ---- Runtime protection: check after decoding --------------------------- *
+ * has_error():   sticky flag set when the rANS state desynchronized or the
+ *                stream was corrupt/truncated (overrun, bad CDF lookup).
+ *                On error the decoded symbols are garbage and the caller must
+ *                NOT trust them (e.g. trigger error concealment / resync).
+ * bytes_consumed(): bytes read since the last set_stream(); for a valid,
+ *                synchronized stream this equals the stream length passed to
+ *                set_stream().  A mismatch proves desync even without an
+ *                explicit overrun.                                          */
+int    dcvc_rans_decoder_has_error(DcvcRansDecoder* dec);
+size_t dcvc_rans_decoder_bytes_consumed(DcvcRansDecoder* dec);
+
+/* Standard CRC-32 (IEEE 802.3, poly 0xEDB88320). Lets callers append an
+ * integrity tag to the entropy stream / frame to catch in-transit bit flips
+ * (the rANS state machine itself cannot detect channel corruption). */
+uint32_t dcvc_crc32(const void* data, size_t len);
+
 /* PMF → quantized CDF (precision typically 16). out must hold pmf_n+1 ints. */
 void dcvc_pmf_to_quantized_cdf(const float* pmf, int pmf_n, int precision, uint32_t* out_cdf);
 

@@ -10,7 +10,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Directory holding the runtime ONNX models + CDF tables (onnx/models by default).
+# Directory holding the runtime ONNX models + CDF tables.
+# onnx/models ships FIXED-POINT (fxp) networks by default: ALL 11 entropy nets
+# (7 intra + 4 inter) AND all 6 inter reconstruction/feature nets use integer
+# arithmetic (com.dcvc FxpConv/FxpWsRelu custom ops), which is cross-platform
+# bit-exact by construction (integer math is associative). This eliminates the
+# FP32 reference drift that caused entropy_sync desync between MSVC and GCC
+# ONNX Runtime builds. The original FP32 models are kept under onnx/models_fp32/
+# for RD comparison only.
 set(DCVC_ONNX_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models"
     CACHE PATH "Directory with *.onnx models and *.npy CDF tables")
 
@@ -34,6 +41,9 @@ set(ORT_VERSION "1.27.0" CACHE STRING "ONNX Runtime version to fetch")
 # CUDA/cuDNN, and TensorRT for the TensorRT EP, installed on the system).
 # OFF: fetch the CPU-only package.
 option(DCVC_ORT_GPU "Fetch the CUDA-enabled ONNX Runtime package" OFF)
+# Build FXP CUDA kernels + register CUDAExecutionProvider custom ops.
+# Independent of DCVC_ORT_GPU: kernels can be tested without ORT GPU EP.
+option(DCVC_FXP_CUDA "Build CUDA backends for com.dcvc FXP custom ops" ON)
 # When DCVC_ORT_GPU=ON, select the CUDA major version of the ORT package
 # (ORT 1.27+ splits GPU packages by CUDA version: gpu_cuda12 / gpu_cuda13).
 set(DCVC_ORT_CUDA_VERSION "12" CACHE STRING "CUDA major version for the GPU-enabled ORT package (12 or 13)")
@@ -141,6 +151,12 @@ function(dcvc_onnx_add_executable name)
     if(NOT WIN32)
         target_link_libraries(${name} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     endif()
+    if(DCVC_FXP_CUDA_ENABLED)
+        target_compile_definitions(${name} PRIVATE DCVC_FXP_CUDA=1)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(${name} PRIVATE CUDA::cudart)
+        set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+    endif()
 
     if(MINGW)
         # Statically link the MinGW C/C++/pthread runtimes so the produced
@@ -164,8 +180,60 @@ set(DCVC_NPY_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/npy_reader.c)
 # Shared helpers used by every test executable (model-dir auto-detection).
 set(DCVC_COMMON_SRC ${DCVC_NPY_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/src/model_dir.c)
 
+set(DCVC_FXP_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/det_conv.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_wsrelu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_scale_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/ort_custom_ops.cpp
+)
+
+set(DCVC_FXP_CUDA_ENABLED FALSE)
+if(DCVC_FXP_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        list(APPEND DCVC_FXP_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_cuda.cu)
+        set(DCVC_FXP_CUDA_ENABLED TRUE)
+        message(STATUS "DCVC FXP CUDA: enabled (${CMAKE_CUDA_COMPILER})")
+    else()
+        message(WARNING "DCVC_FXP_CUDA=ON but no CUDA compiler found; building CPU-only FXP")
+    endif()
+endif()
+
+# Layout-friendly FXP C kernels: enable auto-vectorization (no intrinsics).
+if(NOT MSVC)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_wsrelu.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_scale_index.c
+        PROPERTIES COMPILE_OPTIONS "-O3;-mavx2"
+    )
+    # det_conv.c: float64 accumulation — disable FMA contraction for
+    # cross-platform bit-exactness.
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/det_conv.c
+        PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-ffp-contract=off;-fno-fast-math"
+    )
+endif()
+
+if(DCVC_FXP_CUDA_ENABLED)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/ort_custom_ops.cpp
+        PROPERTIES COMPILE_DEFINITIONS "DCVC_FXP_CUDA=1"
+    )
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_cuda.cu
+        PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr;-fmad=false"
+    )
+endif()
+
 set(DCVC_CODEC_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/onnx_engine.cpp
+    ${DCVC_FXP_SRCS}
     ${DCVC_COMMON_SRC}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu_ar_codec.c
 )
@@ -182,8 +250,50 @@ set(DCVC_INTER_PIPELINE_SRCS
 
 dcvc_onnx_add_executable(test_intra_analysis
     SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/onnx_engine.cpp
+         ${DCVC_FXP_SRCS}
          ${DCVC_COMMON_SRC}
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_intra_analysis.cpp)
+
+dcvc_onnx_add_executable(test_fxp_conv1x1
+    SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/onnx_engine.cpp
+         ${DCVC_FXP_SRCS}
+         ${DCVC_COMMON_SRC}
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fxp_conv1x1.cpp)
+
+dcvc_onnx_add_executable(test_fxp_scale_index
+    SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_scale_index.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/npy_reader.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fxp_scale_index.cpp)
+
+dcvc_onnx_add_executable(test_fxp_opt_bitexact
+    SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_wsrelu.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fxp_opt_bitexact.cpp)
+
+dcvc_onnx_add_executable(bench_fxp_conv
+    SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fxp_baseline_kernels.c
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_fxp_conv.cpp)
+if(NOT MSVC)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fxp_baseline_kernels.c
+        PROPERTIES COMPILE_OPTIONS "-O3;-mavx2"
+    )
+endif()
+
+if(DCVC_FXP_CUDA_ENABLED)
+    dcvc_onnx_add_executable(test_fxp_cuda_bitexact
+        SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_conv.c
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_wsrelu.c
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_cuda.cu
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fxp_cuda_bitexact.cpp)
+endif()
+
+if(DCVC_ORT_GPU AND DCVC_FXP_CUDA_ENABLED)
+    dcvc_onnx_add_executable(test_fxp_session_cuda
+        SRCS ${DCVC_PIPELINE_SRCS}
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fxp_session_cuda.cpp)
+endif()
 
 dcvc_onnx_add_executable(test_ar_cpu
     SRCS ${DCVC_CODEC_SRCS}
