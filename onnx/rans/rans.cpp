@@ -270,6 +270,12 @@ void RansEncoderLib::reset()
 {
     m_pendingEncodingList.clear();
     _stream->clear();
+    /* The CDF groups pushed by add_cdf() are per-frame state: every pipeline
+     * calls reset() at frame start and re-adds its CDFs right after. Without
+     * this, _ransSymbols/_cdfs_sizes/_offsets grow by 1-2 groups per frame
+     * and are never released (the decoder side already does this via
+     * reset_cdf()). */
+    empty_cdf_buffer();
 }
 
 RansEncoderLibMultiThread::RansEncoderLibMultiThread()

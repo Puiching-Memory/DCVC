@@ -143,12 +143,14 @@ uv run python python/fxp_export_entropy_nets.py \
   --src-dir models_fp32 --out-dir models_fxp --calib-dir python/calib_fxp_all
 
 # Linux round-trip
-./build/test_cpu_inter --model-dir models --encode akiyo_10frames.npy out.bin 32 32
-./build/test_cpu_inter --model-dir models --decode out.bin out_dec.npy
+./out/build/linux-x64/test_cpu_inter --model-dir models_720p \
+  --encode akiyo_10frames.npy out.bin 32 32
+./out/build/linux-x64/test_cpu_inter --model-dir models_720p \
+  --decode out.bin out_dec.npy
 
 # Windows package (MinGW cross)
-cmake --build build-mingw --target dcvc_package
-# or ship: dist/dcvc_onnx_codec_fxp_win64.zip
+cmake --build out/build/windows-x64-mingw --target dcvc_package
+# or build a versioned archive under out/packages/ with scripts/package.sh
 ```
 
 Cross-OS: encode on one OS, `--decode` on the other with the **same FXP model

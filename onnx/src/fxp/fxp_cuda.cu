@@ -137,6 +137,92 @@ __global__ void k_dw3x3(const int16_t* xq, const int16_t* w_int,
     y[oc * hw + spat] = __fadd_rn(t, bias[oc]);
 }
 
+/* General grouped convolution. Each CTA computes an OC_TILE x S_TILE output
+ * tile for one group. Activations and weights are staged in reduction tiles,
+ * preserving the CPU int64 dot-product semantics while sharing each input
+ * value across the output-channel tile. */
+__global__ void k_conv_general(const int16_t* xq, const int16_t* w_int,
+                               const float* w_scale, const float* bias,
+                               float* y, int cin, int cout, int h, int w,
+                               int oh, int ow, int kh, int kw,
+                               int pad_t, int pad_l,
+                               int stride_h, int stride_w, int group,
+                               float x_scale)
+{
+    extern __shared__ int16_t smem[];
+    int16_t* s_act = smem;                       /* [S_TILE][RED] */
+    int16_t* s_wgt = smem + C1_S_TILE * C1_RED;  /* [OC_TILE][RED] */
+
+    const int cin_g = cin / group;
+    const int cout_g = cout / group;
+    const int k_area = kh * kw;
+    const int red_total = cin_g * k_area;
+    const int g = blockIdx.z;
+    const int oc0_g = blockIdx.x * C1_OC_TILE;
+    const int s0 = blockIdx.y * C1_S_TILE;
+    const int tid = threadIdx.x;
+    const int oc_local = tid / C1_S_TILE;
+    const int s_local = tid - oc_local * C1_S_TILE;
+    const int oc_g = oc0_g + oc_local;
+    const int oc = g * cout_g + oc_g;
+    const int s = s0 + s_local;
+    const int y_hw = oh * ow;
+    const bool valid = (oc_g < cout_g) && (s < y_hw);
+
+    long long acc = 0;
+    for (int r0 = 0; r0 < red_total; r0 += C1_RED) {
+        for (int k = tid; k < C1_S_TILE * C1_RED;
+             k += C1_OC_TILE * C1_S_TILE) {
+            const int sl = k / C1_RED;
+            const int ri = k - sl * C1_RED;
+            const int s_g = s0 + sl;
+            const int red = r0 + ri;
+            int16_t v = 0;
+            if (s_g < y_hw && red < red_total) {
+                const int ic_g = red / k_area;
+                const int tap = red - ic_g * k_area;
+                const int ky = tap / kw;
+                const int kx = tap - ky * kw;
+                const int oy = s_g / ow;
+                const int ox = s_g - oy * ow;
+                const int iy = oy * stride_h + ky - pad_t;
+                const int ix = ox * stride_w + kx - pad_l;
+                if ((unsigned)iy < (unsigned)h && (unsigned)ix < (unsigned)w) {
+                    const int ic = g * cin_g + ic_g;
+                    v = xq[((size_t)ic * h + iy) * w + ix];
+                }
+            }
+            s_act[sl * C1_RED + ri] = v;
+        }
+        for (int k = tid; k < C1_OC_TILE * C1_RED;
+             k += C1_OC_TILE * C1_S_TILE) {
+            const int ol = k / C1_RED;
+            const int ri = k - ol * C1_RED;
+            const int oc_g_load = oc0_g + ol;
+            const int red = r0 + ri;
+            s_wgt[ol * C1_RED + ri] =
+                (oc_g_load < cout_g && red < red_total)
+                    ? w_int[(size_t)(g * cout_g + oc_g_load) * red_total + red]
+                    : (int16_t)0;
+        }
+        __syncthreads();
+
+        if (valid) {
+            const int16_t* arow = s_act + s_local * C1_RED;
+            const int16_t* wrow = s_wgt + oc_local * C1_RED;
+            for (int ri = 0; ri < C1_RED; ri++)
+                acc += (long long)arow[ri] * (long long)wrow[ri];
+        }
+        __syncthreads();
+    }
+
+    if (valid) {
+        const float scale = __fmul_rn(x_scale, w_scale[oc]);
+        const float t = __fmul_rn((float)acc, scale);
+        y[(size_t)oc * y_hw + s] = __fadd_rn(t, bias[oc]);
+    }
+}
+
 __global__ void k_wsrelu(const float* x, float* y, const float* lut,
                          int n_elem, float inv_x)
 {
@@ -283,6 +369,10 @@ extern "C" int fxp_conv_f32_cuda(const float* x, float* y,
                                  int stride_h, int stride_w, int group,
                                  void* cuda_stream)
 {
+    if (n < 1 || cin < 1 || cout < 1 || h < 1 || w < 1 ||
+        kh < 1 || kw < 1 || stride_h < 1 || stride_w < 1 ||
+        group < 1 || cin % group != 0 || cout % group != 0)
+        return 2;
     if (kh == 1 && kw == 1 && group == 1
         && pad_t == 0 && pad_l == 0 && pad_b == 0 && pad_r == 0
         && stride_h == 1 && stride_w == 1)
@@ -293,7 +383,43 @@ extern "C" int fxp_conv_f32_cuda(const float* x, float* y,
         && stride_h == 1 && stride_w == 1)
         return fxp_dwconv3x3_f32_cuda(x, y, n, cin, h, w,
                                       w_int, w_scale, bias, x_scale, cuda_stream);
-    return -1;
+
+    const int oh = (h + pad_t + pad_b - kh) / stride_h + 1;
+    const int ow = (w + pad_l + pad_r - kw) / stride_w + 1;
+    if (oh < 1 || ow < 1)
+        return 2;
+    const int x_hw = h * w;
+    const int y_hw = oh * ow;
+    const size_t xq_bytes = (size_t)cin * (size_t)x_hw * sizeof(int16_t);
+    if (ensure_scratch(xq_bytes))
+        return 1;
+    int16_t* xq = (int16_t*)g_scratch.ptr;
+    cudaStream_t st = as_stream(cuda_stream);
+    const float inv_x = 1.0f / x_scale;
+    const int threads = C1_OC_TILE * C1_S_TILE;
+    const size_t smem_bytes =
+        (size_t)(C1_S_TILE + C1_OC_TILE) * C1_RED * sizeof(int16_t);
+
+    for (int ni = 0; ni < n; ni++) {
+        const float* x_n = x + (size_t)ni * cin * x_hw;
+        float* y_n = y + (size_t)ni * cout * y_hw;
+        const int n_elem = cin * x_hw;
+        const int blocks_q = (n_elem + threads - 1) / threads;
+        k_quant_nchw<<<blocks_q, threads, 0, st>>>(x_n, xq, n_elem, inv_x);
+        if (launch_ok(cudaGetLastError(), "k_quant_nchw_general"))
+            return 3;
+
+        const int cout_g = cout / group;
+        dim3 grid((cout_g + C1_OC_TILE - 1) / C1_OC_TILE,
+                  (y_hw + C1_S_TILE - 1) / C1_S_TILE,
+                  group);
+        k_conv_general<<<grid, threads, smem_bytes, st>>>(
+            xq, w_int, w_scale, bias, y_n, cin, cout, h, w, oh, ow, kh, kw,
+            pad_t, pad_l, stride_h, stride_w, group, x_scale);
+        if (launch_ok(cudaGetLastError(), "k_conv_general"))
+            return 4;
+    }
+    return 0;
 }
 
 extern "C" int fxp_wsrelu_f32_cuda(const float* x, float* y, int n_elem,

@@ -51,8 +51,8 @@ in FP32 with no custom-op registration.
 cd onnx
 bash scripts/build_linux.sh
 # or, manually:
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+cmake -S . -B out/build/linux-x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build out/build/linux-x64 -j$(nproc)
 ```
 
 ### Windows (x64 Native Tools / PowerShell)
@@ -60,13 +60,23 @@ cmake --build build -j$(nproc)
 cd onnx
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 # or, manually:
-cmake -S . -B build -A x64
-cmake --build build --config Release
+cmake -S . -B out/build/windows-x64-msvc -A x64
+cmake --build out/build/windows-x64-msvc --config Release
 ```
 
-Binaries are placed directly under `build/` (Linux) or `build/Release/`
-(Windows). The ONNX Runtime shared library is copied next to them automatically,
-and on Linux an `$ORIGIN` RPATH is set so they run without `LD_LIBRARY_PATH`.
+All generated files live below `out/`: CMake intermediates in
+`out/build/<platform>/`, ready-to-run folders in `out/runnable/<platform>/`,
+temporary SDK staging in `out/staging/`, and final archives only in
+`out/packages/`. Staging is removed after a successful archive unless
+`--keep-staging` / `-KeepStaging` is requested. The ONNX Runtime shared library
+is copied next to the binaries; on Linux an `$ORIGIN` RPATH allows them to run
+without `LD_LIBRARY_PATH`.
+
+Set the `DCVC_OUTPUT_ROOT` environment variable when using the scripts, or the
+same-named CMake cache path, to relocate the complete tree without changing its
+internal layout.
+GPU-enabled SDK packaging appends `-gpu` to the platform directory and archive
+name, so it cannot overwrite a CPU build.
 
 ### GPU execution (optional)
 
@@ -79,14 +89,15 @@ enable the CUDA or TensorRT execution provider:
 #    have matching CUDA + cuDNN installed (plus TensorRT for the TensorRT EP);
 #    see the ONNX Runtime 1.27 release notes for exact versions.
 #    For CUDA 13, add -DDCVC_ORT_CUDA_VERSION=13.
-cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release -DDCVC_ORT_GPU=ON
-cmake --build build-gpu -j$(nproc)
+cmake -S . -B out/build/linux-x64-gpu -DCMAKE_BUILD_TYPE=Release \
+  -DDCVC_ORT_GPU=ON -DDCVC_ARTIFACT_TAG=linux-x64-gpu
+cmake --build out/build/linux-x64-gpu -j$(nproc)
 
 # 2. Select the execution provider at runtime:
-DCVC_USE_GPU=1 ./build-gpu/test_cpu_end2end   # CUDA EP
-DCVC_USE_GPU=2 ./build-gpu/test_cpu_end2end   # TensorRT EP
-DCVC_USE_GPU=0 ./build-gpu/test_cpu_end2end   # CPU (default)
-DCVC_GPU_DEVICE=1 DCVC_USE_GPU=1 ./build-gpu/test_cpu_end2end  # second GPU
+DCVC_USE_GPU=1 ./out/build/linux-x64-gpu/test_cpu_end2end   # CUDA EP
+DCVC_USE_GPU=2 ./out/build/linux-x64-gpu/test_cpu_end2end   # TensorRT EP
+DCVC_USE_GPU=0 ./out/build/linux-x64-gpu/test_cpu_end2end   # CPU (default)
+DCVC_GPU_DEVICE=1 DCVC_USE_GPU=1 ./out/build/linux-x64-gpu/test_cpu_end2end
 ```
 
 If the requested provider is not compiled into the fetched ONNX Runtime (e.g.
@@ -120,9 +131,9 @@ lookup — no runtime `logf`/`floorf`. Encode and decode both call this path.
 ```bash
 # Regenerate the fxp nets into a directory (real-content activation calibration):
 uv run python python/fxp_export_entropy_nets.py --calib-dir <calib> --out-dir models_fxp
-cmake --build build --target test_fxp_scale_index test_cpu_end2end
-./build/test_fxp_scale_index
-./build/test_cpu_end2end models_fxp 128 128 32
+cmake --build out/build/linux-x64 --target test_fxp_scale_index test_cpu_end2end
+./out/build/linux-x64/test_fxp_scale_index
+./out/build/linux-x64/test_cpu_end2end models_fxp 128 128 32
 ```
 
 ### Cross-compile Windows from Linux (MinGW-w64)
@@ -148,12 +159,12 @@ ship. The produced `.exe` files are real PE binaries that run on any Windows x64
 machine. To assemble a ready-to-distribute Windows folder from the cross build:
 
 ```bash
-cmake --build onnx/build-mingw --target dcvc_package
-# -> onnx/dist/dcvc_onnx_codec/*.exe + onnxruntime.dll + models
+cmake --build out/build/windows-x64-mingw --target dcvc_package
+# -> out/runnable/windows-x64-mingw/
 ```
 
-Zip `onnx/dist/dcvc_onnx_codec/` and ship it — no compiler is needed on the
-Windows side.
+The runnable folder can be copied directly to Windows. For a versioned zip
+under `out/packages/`, use `scripts/package.sh --target mingw`.
 
 > **⚠️ Wine is a smoke test, not a cross-platform proof.** A quick sanity check
 > on the Linux host with `wine ./test_cpu_end2end.exe ../models 256 256 32` (and
@@ -172,24 +183,31 @@ Windows side.
 
 ## Package a runnable folder
 
-The `dcvc_package` target assembles a self-contained `dist/dcvc_onnx_codec/`
-folder with the executables, the ONNX Runtime shared lib, all models, and the CDF
-tables — ready to copy to any machine of the same OS.
+The `dcvc_package` target assembles a self-contained
+`out/runnable/<platform>/` folder with the executables, the ONNX Runtime shared
+lib, and every discovered resolution model pack under
+`models/<name>/`. By default it discovers directories named `models_<resolution>`
+(currently `models_720p` and `models_1080p`; a future `models_2160p` is picked
+up without code changes). To supply an explicit set, configure with a quoted
+semicolon-separated list such as
+`-DDCVC_ONNX_MODEL_PACKS="720p=/path/a;1080p=/path/b"`.
 
 ```bash
 # Linux
-cmake --build build --target dcvc_package
+cmake --build out/build/linux-x64 --target dcvc_package
 # Windows
-cmake --build build --config Release --target dcvc_package
+cmake --build out/build/windows-x64-msvc --config Release --target dcvc_package
 ```
 
-Run from inside the packaged folder (models are looked up in the current dir):
+Run from inside the packaged folder and select the matching model pack:
 ```bash
-./test_cpu_end2end . 256 256 32          # Linux
-test_cpu_end2end.exe . 256 256 32        # Windows
+./test_cpu_end2end models/720p 768 1280 32             # Linux, 720p pack
+./test_cpu_end2end models/1080p 1088 1920 32           # Linux, 1080p pack
+test_cpu_end2end.exe models\720p 768 1280 32            # Windows, 720p pack
+test_cpu_end2end.exe models\1080p 1088 1920 32          # Windows, 1080p pack
 ```
-`H` and `W` may be **any positive integers** -- the codec pads to the next
-multiple of 64 internally and crops back (see *Dynamic resolution* below).
+`H` and `W` must each be a **multiple of 64** (see *Dynamic resolution*
+below).
 
 ### Double-click on Windows (console stays open)
 
@@ -229,7 +247,7 @@ feature_adaptor_i(pixel_unshuffle(x_hat_prev))      # ref frame -> feature
 Run a closed-loop I+P sequence (frame 0 intra, the rest inter):
 
 ```bash
-./test_cpu_inter 5 256 256 32 32      # N H W qp_i qp_p  (any H,W)
+./test_cpu_inter 5 256 256 32 32      # N H W qp_i qp_p  (H,W multiples of 64)
 ```
 
 On real video this gives a large rate saving vs coding every frame as I-frame
@@ -237,38 +255,36 @@ On real video this gives a large rate saving vs coding every frame as I-frame
 
 ## Dynamic resolution
 
-The codec accepts **any positive `H` and `W`**; it no longer requires multiples
-of 64. Each pipeline pads the input to the next multiple of 64 with edge
-replication (`F.pad(mode="replicate")` semantics), runs the network on the
-padded frame, then crops the reconstruction back to the original size. The
-bitstream stores the original `H,W` so the decoder reconstructs exactly the
-requested resolution.
+`H` and `W` must each be a **multiple of 64**; both pipelines reject other
+sizes with `invalid_arg`. The networks operate on the frame at 1/8 (feature),
+1/16 (y latent) and 1/64 (z hyper) resolutions, and the checkerboard AR masks
+are built on the 1/16 plane, so the frame size must divide evenly by 64.
 
-All exported models use dynamo `dynamic_shapes` so spatial dims are symbolic;
-`intra_analysis_standard.onnx` accepts any `H,W` (multiple of 8 for the
-pixel-unshuffle, and the full pipeline pads to a multiple of 64).
+Within that constraint the resolution is still dynamic: all exported models
+use dynamo `dynamic_shapes`, so a single model pack handles any multiple-of-64
+`H,W` (e.g. 64x64, 512x512, 1280x768, 1920x1088). For a fixed target
+resolution, `export_all_models.py` / `export_inter_models.py` accept
+`--height/--width` to bake every dim to static sizes (the picture size is
+rounded up to a multiple of 64 for the network input, e.g. 720p -> 1280x768,
+1080p -> 1920x1088).
 
-Verified bit-exact round-trips include 64x64, 100x100, 192x256, 200x200,
-270x180, 300x200, 320x192 and 512x512 for I-frames, and 128x128 ... 512x512 for
-P-frames. On real video at a non-64-multiple size (480x270) the codec encodes
-and decodes with no extra loss from the padding crop.
+Verified bit-exact round-trips include 64x64, 192x256, 320x192, 512x512,
+1280x768 and 1920x1088 for I-frames, and 128x128 ... 512x512 for P-frames.
 
 ## Run the tests
 
 ```bash
-cd build                                    # or build\Release on Windows
-./test_intra_analysis                        # analysis parity vs golden tensors
-./test_ar_cpu                                # AR encode/decode round-trip (default 8x8)
-./test_cpu_end2end                           # full I-frame encode/decode round-trip (256x256, qp=32)
-./test_cpu_end2end . 200 200 32               # non-64-multiple H,W works too
+cd onnx
+./out/build/linux-x64/test_ar_cpu models_720p 48 80
+./out/build/linux-x64/test_cpu_end2end models_720p 768 1280 32
 ```
 
-The test binaries auto-detect the model directory (they probe `.`, `../models`,
-then `models`), so the model-dir argument is optional -- it is only needed when
-the models live elsewhere. `test_cpu_end2end` also accepts real data and a
-reference tensor for comparison:
+Pass the model pack explicitly when running from the source tree. Packaged
+binaries use the corresponding `models/<name>` directory. `test_cpu_end2end`
+also accepts real data and a reference tensor for comparison:
 ```bash
-./test_cpu_end2end 256 256 32 input.npy out.npy ref.npy
+./out/build/linux-x64/test_cpu_end2end \
+  models_720p 768 1280 32 input.npy out.npy ref.npy
 ```
 
 ## Regenerate the models

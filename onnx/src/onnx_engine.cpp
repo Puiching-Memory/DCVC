@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -183,6 +184,62 @@ static void dcvc_log_ep_once(int ep, int appended)
                 dcvc_ep_name(ep));
 }
 
+/* Process-wide shared OrtEnv with a single global thread pool.
+ *
+ * Previously every engine created its own env, and every session created its
+ * own intra-op thread pool. A round-trip run builds ~50 engines, i.e. ~50
+ * pools; on Windows each thread commits 1 MB of stack up front, which alone
+ * is ~400 MB and OOMs the process after a few dozen frames. ORT supports
+ * sharing one env across all sessions, and with global thread pools the
+ * whole process keeps a single intra-op pool instead.
+ *
+ * The env is intentionally never released: ORT recommends one env per
+ * process, and repeated CreateEnv/ReleaseEnv cycles would just re-churn the
+ * thread pools. Thread counts are governed here; engines opt their sessions
+ * into these global pools via DisablePerSessionThreads (sessions would
+ * otherwise default to per-session pools even on a global-pool env). */
+static OrtEnv* g_dcvc_env = nullptr;
+static std::mutex g_dcvc_env_mutex;
+
+static OrtEnv* dcvc_shared_env(const OrtApi* api, OrtStatus** out_st)
+{
+    std::lock_guard<std::mutex> lk(g_dcvc_env_mutex);
+    if (g_dcvc_env) return g_dcvc_env;
+
+    OrtThreadingOptions* topts = nullptr;
+    OrtStatus* st = api->CreateThreadingOptions(&topts);
+    if (st) { *out_st = st; return nullptr; }
+
+    /* Intra-op threads feed Ort::KernelContext::ParallelFor inside FXP ops.
+     * FXP integer MAC partitioned by output channel is bit-exact for any
+     * thread count. Default: min(8, HW concurrency). Override with
+     * DCVC_ORT_INTRA_OP_THREADS (1 keeps the old single-thread behaviour). */
+    int intra = 8;
+    const char* e = getenv("DCVC_ORT_INTRA_OP_THREADS");
+    if (e && e[0]) {
+        intra = atoi(e);
+        if (intra < 1) intra = 1;
+        if (intra > 64) intra = 64;
+    } else {
+#ifdef _WIN32
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        int hw = (int)si.dwNumberOfProcessors;
+#else
+        int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        if (hw < 1) hw = 1;
+        intra = hw < 8 ? hw : 8;
+    }
+
+    st = api->SetGlobalIntraOpNumThreads(topts, intra);
+    if (!st) st = api->SetGlobalInterOpNumThreads(topts, 1);
+    if (!st) st = api->CreateEnvWithGlobalThreadPools(ORT_LOGGING_LEVEL_WARNING, "dcvc_onnx",
+                                                      topts, &g_dcvc_env);
+    api->ReleaseThreadingOptions(topts);
+    if (st) { *out_st = st; g_dcvc_env = nullptr; return nullptr; }
+    return g_dcvc_env;
+}
+
 DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCpuStatus* out_st)
 {
     if (out_st) *out_st = DCVC_CPU_OK;
@@ -195,7 +252,7 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     eng->api = api;
 
     OrtStatus* st = nullptr;
-    st = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "dcvc_onnx", &eng->env);
+    eng->env = dcvc_shared_env(api, &st);
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
@@ -203,40 +260,20 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
+    /* Route this session to the shared env's global thread pool. Sessions
+     * default to per-session pools even on a global-pool env
+     * (SessionOptions::DEFAULT_USE_PER_SESSION_THREADS == true), so every
+     * engine must opt out explicitly; otherwise each session still spawns
+     * its own pool (~50 engines * N threads * 1 MB committed stack on
+     * Windows was the round-trip OOM). */
+    st = api->DisablePerSessionThreads(eng->opts);
+    check_status(api, st, out_st);
+    if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
+
     /* com.dcvc.FxpConv1x1 etc. — no-op for models that do not use them. */
     if (dcvc_ort_register_custom_ops(api, eng->opts) != 0) {
         fprintf(stderr, "dcvc_onnx: warning: custom op registration failed\n");
     }
-
-    /* Intra-op threads feed Ort::KernelContext::ParallelFor inside FXP ops.
-     * FXP integer MAC partitioned by output channel is bit-exact for any
-     * thread count. Default: min(8, HW concurrency). Override with
-     * DCVC_ORT_INTRA_OP_THREADS (1 keeps the old single-thread behaviour). */
-    {
-        int intra = 8;
-        const char* e = getenv("DCVC_ORT_INTRA_OP_THREADS");
-        if (e && e[0]) {
-            intra = atoi(e);
-            if (intra < 1) intra = 1;
-            if (intra > 64) intra = 64;
-        } else {
-#ifdef _WIN32
-            SYSTEM_INFO si; GetSystemInfo(&si);
-            int hw = (int)si.dwNumberOfProcessors;
-#else
-            int hw = (int)sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-            if (hw < 1) hw = 1;
-            intra = hw < 8 ? hw : 8;
-        }
-        st = api->SetIntraOpNumThreads(eng->opts, intra);
-    }
-    check_status(api, st, out_st);
-    if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
-
-    st = api->SetInterOpNumThreads(eng->opts, 1);
-    check_status(api, st, out_st);
-    if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
     /* Enable deterministic compute mode for cross-platform reproducibility. */
     st = api->AddSessionConfigEntry(eng->opts, "session.use_deterministic_compute", "1");
@@ -251,7 +288,12 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     {
         const char* prof = getenv("DCVC_PROFILE");
         if (prof && prof[0]) {
+            /* EnableProfiling takes ORTCHAR_T* (wchar_t* on Windows). */
+#ifdef _WIN32
+            st = api->EnableProfiling(eng->opts, dcvc_to_wide(prof).c_str());
+#else
             st = api->EnableProfiling(eng->opts, prof);
+#endif
             check_status(api, st, out_st);
             if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
         }
@@ -285,7 +327,8 @@ void dcvc_cpu_engine_destroy(DcvcCpuEngine* eng)
     if (eng->mem_info) api->ReleaseMemoryInfo(eng->mem_info);
     if (eng->session) api->ReleaseSession(eng->session);
     if (eng->opts) api->ReleaseSessionOptions(eng->opts);
-    if (eng->env) api->ReleaseEnv(eng->env);
+    /* eng->env is the process-wide shared env (dcvc_shared_env): not owned
+     * by this engine, never released here. */
     free(eng);
 }
 

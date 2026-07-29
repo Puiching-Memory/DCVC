@@ -8,6 +8,8 @@
 
 #if defined(_MSC_VER)
 #define FXP_TLS __declspec(thread)
+#elif defined(__cplusplus)
+#define FXP_TLS thread_local
 #else
 #define FXP_TLS _Thread_local
 #endif
@@ -370,6 +372,43 @@ static inline void fxp_dw3x3_row_mac16_accum(
     out16[14] = _mm256_extract_epi64(a1hi, 2);
     out16[15] = _mm256_extract_epi64(a1hi, 3);
 }
+
+/* int8 depthwise 3x3 variant: 16 output columns per iteration.
+ * Loads 16 uint8 activations per tap, zero-extends to 16 int32, multiplies by a
+ * broadcast int32 weight (the sign-extended int8 tap) and accumulates into ONE
+ * __m512i int32 vector (one lane per output column). int32 accumulation is safe:
+ * max |255*127| * 9 taps = 291465 << INT32_MAX. As with the i16 helper, the float
+ * dequant (acc-comp)*scale+b is deliberately left to the plain caller so the
+ * mul+add is not FMA-contracted inside the target-attributed body. */
+__attribute__((target("avx512bw")))
+static inline void fxp_dw3x3_row_mac16_accum_i8(
+    const uint8_t* r0, const uint8_t* r1, const uint8_t* r2, int xw,
+    int w00, int w01, int w02,
+    int w10, int w11, int w12,
+    int w20, int w21, int w22,
+    int32_t* out16)
+{
+    __m512i acc = _mm512_setzero_si512();
+    const uint8_t* p0 = r0 + xw;
+    const uint8_t* p1 = r1 + xw;
+    const uint8_t* p2 = r2 + xw;
+#define FXP_DWI8_MAC16(COL, W) do {                                       \
+        __m128i v  = _mm_loadu_si128((const __m128i*)(COL)); /* 16 u8 */   \
+        __m512i vv = _mm512_cvtepu8_epi32(v);            /* 16 -> int32 */  \
+        acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(vv, _mm512_set1_epi32(W))); \
+    } while (0)
+    FXP_DWI8_MAC16(p0,     w00);
+    FXP_DWI8_MAC16(p0 + 1, w01);
+    FXP_DWI8_MAC16(p0 + 2, w02);
+    FXP_DWI8_MAC16(p1,     w10);
+    FXP_DWI8_MAC16(p1 + 1, w11);
+    FXP_DWI8_MAC16(p1 + 2, w12);
+    FXP_DWI8_MAC16(p2,     w20);
+    FXP_DWI8_MAC16(p2 + 1, w21);
+    FXP_DWI8_MAC16(p2 + 2, w22);
+#undef FXP_DWI8_MAC16
+    _mm512_storeu_si512((void*)out16, acc);
+}
 #endif
 
 /* Fused oc-group dot (AVX2): same idea as the zmm kernel, 256-bit lanes. */
@@ -655,6 +694,117 @@ void fxp_dw3x3_oc_range_i16(const int16_t* xq_pad, float* y_nchw,
                     (int64_t)c1[0] * w10 + (int64_t)c1[1] * w11 + (int64_t)c1[2] * w12 +
                     (int64_t)c2[0] * w20 + (int64_t)c2[1] * w21 + (int64_t)c2[2] * w22;
                 yor[xw] = (float)acc * scale + b;
+            }
+        }
+    }
+}
+
+/* ── int8 depthwise 3x3: uint8 act (offset +128, border = 128) × int8 weight ──
+ *
+ * Same padded layout as fxp_dw3x3_*_i16, but activations are uint8 (q_i8+128)
+ * and border cells are 128 (NOT 0): a true-0 float activation quantizes to int8
+ * 0 then offsets to uint8 128. The w8_comp[oc]=128*sum(w8[oc]) subtraction
+ * assumes every one of the 9 taps carries the +128 offset, which is only
+ * correct with a 128 border. int32 accumulation is safe (max 255*127*9=291465). */
+void fxp_dw3x3_pack_i8(const float* x_nchw, uint8_t* xq_pad,
+                       int c, int h, int w, float x_scale)
+{
+    const float inv_x = 1.0f / x_scale;
+    const int Wpad = w + 2;
+    const size_t cpad = (size_t)(h + 2) * (size_t)Wpad;
+    /* Fill EVERY cell with 128 first so all border cells (top/bottom rows,
+     * left/right columns) are exactly 128, then overwrite the data cells. */
+    memset(xq_pad, 128, cpad * (size_t)c * sizeof(uint8_t));
+    for (int ic = 0; ic < c; ic++) {
+        const float* xc = x_nchw + (size_t)ic * (size_t)h * (size_t)w;
+        /* qc points at padded row 1, col 1 (first data cell). */
+        uint8_t* qc = xq_pad + (size_t)ic * cpad + (size_t)Wpad + 1;
+        for (int r = 0; r < h; r++) {
+            const float* src = xc + (size_t)r * (size_t)w;
+            uint8_t* dst = qc + (size_t)r * (size_t)Wpad;
+            for (int cc = 0; cc < w; cc++)
+                dst[cc] = (uint8_t)(fxp_quantize_act_i8(src[cc], inv_x) + 128);
+        }
+    }
+}
+
+void fxp_dw3x3_oc_range_i8(const uint8_t* xq_pad, float* y_nchw,
+                           int c, int h, int w,
+                           const int8_t* w8, const float* w8_scale,
+                           const int32_t* w8_comp, const float* bias,
+                           float x_scale, int oc_start, int oc_end)
+{
+    (void)c;
+    const int hw = h * w;
+    const int Wpad = w + 2;
+    const size_t cpad = (size_t)(h + 2) * (size_t)Wpad;
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        const int8_t* wk = w8 + (size_t)oc * 9;
+        float* yo = y_nchw + (size_t)oc * hw;
+        const uint8_t* qi = xq_pad + (size_t)oc * cpad;  /* padded [h+2][w+2] */
+        const float scale = x_scale * w8_scale[oc];
+        const float b = bias[oc];
+        const int32_t comp = w8_comp[oc];
+        const int w00 = wk[0], w01 = wk[1], w02 = wk[2];
+        const int w10 = wk[3], w11 = wk[4], w12 = wk[5];
+        const int w20 = wk[6], w21 = wk[7], w22 = wk[8];
+        /* Window indexing identical to the i16 path: output pixel (yh,xw) reads
+         * padded rows [yh, yh+1, yh+2] x cols [xw, xw+1, xw+2]; border cells are
+         * 128 and the +128 offset is cancelled once via w8_comp[oc]. */
+        for (int yh = 0; yh < h; yh++) {
+            const uint8_t* r0 = qi + (size_t)(yh + 0) * Wpad;
+            const uint8_t* r1 = qi + (size_t)(yh + 1) * Wpad;
+            const uint8_t* r2 = qi + (size_t)(yh + 2) * Wpad;
+            float* yor = yo + (size_t)yh * w;
+            int xw = 0;
+#if defined(__AVX2__)
+#if defined(__GNUC__) && defined(__x86_64__)
+            if (fxp_have_avx512bw_) {
+                for (; xw + 16 <= w; xw += 16) {
+                    int32_t acc16[16] __attribute__((aligned(64)));
+                    fxp_dw3x3_row_mac16_accum_i8(r0, r1, r2, xw,
+                                                 w00, w01, w02, w10, w11, w12,
+                                                 w20, w21, w22, acc16);
+                    for (int i = 0; i < 16; i++)
+                        yor[xw + i] = (float)(acc16[i] - comp) * scale + b;
+                }
+            }
+#endif
+            for (; xw + 8 <= w; xw += 8) {
+                __m256i acc = _mm256_setzero_si256();
+                const uint8_t* p0 = r0 + xw;
+                const uint8_t* p1 = r1 + xw;
+                const uint8_t* p2 = r2 + xw;
+#define FXP_DWI8_MAC8(COL, W) do {                                      \
+                    __m128i v  = _mm_loadl_epi64((const __m128i*)(COL)); \
+                    __m256i vv = _mm256_cvtepu8_epi32(v);  /* 8 -> int32 */ \
+                    acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(vv, _mm256_set1_epi32(W))); \
+                } while (0)
+                FXP_DWI8_MAC8(p0,     w00);
+                FXP_DWI8_MAC8(p0 + 1, w01);
+                FXP_DWI8_MAC8(p0 + 2, w02);
+                FXP_DWI8_MAC8(p1,     w10);
+                FXP_DWI8_MAC8(p1 + 1, w11);
+                FXP_DWI8_MAC8(p1 + 2, w12);
+                FXP_DWI8_MAC8(p2,     w20);
+                FXP_DWI8_MAC8(p2 + 1, w21);
+                FXP_DWI8_MAC8(p2 + 2, w22);
+#undef FXP_DWI8_MAC8
+                int32_t tmp[8] __attribute__((aligned(32)));
+                _mm256_storeu_si256((__m256i*)tmp, acc);
+                for (int i = 0; i < 8; i++)
+                    yor[xw + i] = (float)(tmp[i] - comp) * scale + b;
+            }
+#endif
+            for (; xw < w; xw++) {
+                const uint8_t* c0 = r0 + xw;
+                const uint8_t* c1 = r1 + xw;
+                const uint8_t* c2 = r2 + xw;
+                int32_t acc =
+                    (int32_t)c0[0] * w00 + (int32_t)c0[1] * w01 + (int32_t)c0[2] * w02 +
+                    (int32_t)c1[0] * w10 + (int32_t)c1[1] * w11 + (int32_t)c1[2] * w12 +
+                    (int32_t)c2[0] * w20 + (int32_t)c2[1] * w21 + (int32_t)c2[2] * w22;
+                yor[xw] = (float)(acc - comp) * scale + b;
             }
         }
     }

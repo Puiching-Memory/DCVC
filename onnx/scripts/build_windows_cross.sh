@@ -2,7 +2,8 @@
 # Cross-compile the DCVC CPU ONNX codec for Windows x64 on a Linux host,
 # using the MinGW-w64 toolchain, then assemble a runnable package.
 #
-# Output: onnx/build-mingw/*.exe  +  onnx/dist/dcvc_onnx_codec/*.exe
+# Output: onnx/out/build/windows-x64-mingw/*.exe
+#         onnx/out/runnable/windows-x64-mingw/*.exe
 #
 # Prerequisites (Debian/Ubuntu):
 #   sudo apt-get install mingw-w64
@@ -32,11 +33,17 @@ if ! command -v x86_64-w64-mingw32-gcc-posix >/dev/null 2>&1; then
     exit 1
 fi
 
-BUILD_DIR="${ONNX_DIR}/build-mingw"
+OUTPUT_ROOT="${DCVC_OUTPUT_ROOT:-${ONNX_DIR}/out}"
+ARTIFACT_TAG="windows-x64-mingw"
+BUILD_DIR="${OUTPUT_ROOT}/build/${ARTIFACT_TAG}"
+RUNNABLE_DIR="${OUTPUT_ROOT}/runnable/${ARTIFACT_TAG}"
 
 CMAKE_ARGS=(
     -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN}"
     -DCMAKE_BUILD_TYPE=Release
+    -DDCVC_FXP_CUDA=OFF
+    -DDCVC_OUTPUT_ROOT="${OUTPUT_ROOT}"
+    -DDCVC_ARTIFACT_TAG="${ARTIFACT_TAG}"
 )
 [ -n "${DCVC_ORT_ARCHIVE:-}" ]  && CMAKE_ARGS+=(-DDCVC_ORT_ARCHIVE="$(readlink -f "${DCVC_ORT_ARCHIVE}")")
 [ -n "${DCVC_ORT_URL_BASE:-}" ] && CMAKE_ARGS+=(-DDCVC_ORT_URL_BASE="${DCVC_ORT_URL_BASE}")
@@ -47,13 +54,12 @@ cmake -S "${ONNX_DIR}" -B "${BUILD_DIR}" "${CMAKE_ARGS[@]}"
 echo "== Cross-building =="
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
-echo "== Packaging into onnx/dist/dcvc_onnx_codec/ =="
+echo "== Packaging into ${RUNNABLE_DIR} =="
 cmake --build "${BUILD_DIR}" --target dcvc_package
 
 echo
 echo "Done. Windows executables:"
 echo "  ${BUILD_DIR}/*.exe"
-echo "  ${ONNX_DIR}/dist/dcvc_onnx_codec/*.exe  (runnable folder)"
+echo "  ${RUNNABLE_DIR}/*.exe  (runnable folder)"
 echo
-echo "Copy onnx/dist/dcvc_onnx_codec/ to a Windows x64 machine and run:"
-echo "  test_cpu_end2end.exe . 256 256 32"
+echo "Copy ${RUNNABLE_DIR}/ to a Windows x64 machine."

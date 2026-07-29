@@ -22,17 +22,28 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# The top-level src/ is the CVPR-2026 code without video_model.py; the shipped
+# inter models come from DCVC-family/DCVC-RT. --src-root selects which tree
+# provides the src/ package. Pre-parsed here because the src.* imports below
+# happen at module load time.
+SRC_ROOT = ROOT
+for _i, _a in enumerate(sys.argv):
+    if _a == '--src-root' and _i + 1 < len(sys.argv):
+        SRC_ROOT = os.path.abspath(sys.argv[_i + 1])
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
+
 src = types.ModuleType('src')
-src.__path__ = [os.path.join(ROOT, 'src')]
+src.__path__ = [os.path.join(SRC_ROOT, 'src')]
 sys.modules['src'] = src
 models = types.ModuleType('models')
-models.__path__ = [os.path.join(ROOT, 'src', 'models')]
+models.__path__ = [os.path.join(SRC_ROOT, 'src', 'models')]
 sys.modules['src.models'] = models
 layers = types.ModuleType('layers')
-layers.__path__ = [os.path.join(ROOT, 'src', 'layers')]
+layers.__path__ = [os.path.join(SRC_ROOT, 'src', 'layers')]
 sys.modules['src.layers'] = layers
 utils = types.ModuleType('utils')
-utils.__path__ = [os.path.join(ROOT, 'src', 'utils')]
+utils.__path__ = [os.path.join(SRC_ROOT, 'src', 'utils')]
 sys.modules['src.utils'] = utils
 
 import numpy as np
@@ -73,7 +84,7 @@ def axes_for(name, spatial_names, feature_names):
 
 
 def export_module(path, module, args, input_names, output_names, spatial_names,
-                  feature_names):
+                  feature_names, fixed_size=False):
     """Export one wrapper/module to ONNX with dynamic spatial axes (dims 2,3).
 
     Only names in `spatial_names` (the feature/latent tensors) get dynamic
@@ -82,12 +93,16 @@ def export_module(path, module, args, input_names, output_names, spatial_names,
     H/16 y plane).
 
     Uses the dynamo exporter at the latest opset supported by ORT 1.27.
+    With fixed_size=True no dynamic axes are declared: all dims are baked
+    to the example-input sizes (fixed-resolution model pack).
     """
-    dynamic_axes = {}
-    for n in input_names + output_names:
-        ax = axes_for(n, spatial_names, feature_names)
-        if ax is not None:
-            dynamic_axes[n] = ax
+    dynamic_axes = None
+    if not fixed_size:
+        dynamic_axes = {}
+        for n in input_names + output_names:
+            ax = axes_for(n, spatial_names, feature_names)
+            if ax is not None:
+                dynamic_axes[n] = ax
     torch.onnx.export(
         module, args, path,
         input_names=input_names, output_names=output_names,
@@ -277,9 +292,33 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out-dir', default=os.path.join(ROOT, 'onnx', 'models'))
     parser.add_argument('--checkpoint', default=os.path.join(ROOT, 'checkpoints', 'cvpr2025_video.pth.tar'))
+    parser.add_argument('--src-root', default=SRC_ROOT,
+                        help='tree providing the src/ package to export from '
+                             '(default: repo top-level; use DCVC-family/DCVC-RT '
+                             'for the shipped cvpr2025 models)')
+    parser.add_argument('--height', type=int, default=None,
+                        help='fixed picture height (padded up to a multiple of 64); '
+                             'omit for dynamic H/W')
+    parser.add_argument('--width', type=int, default=None,
+                        help='fixed picture width (padded up to a multiple of 64); '
+                             'omit for dynamic H/W')
     args = parser.parse_args()
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
+
+    fixed_size = args.height is not None or args.width is not None
+    if fixed_size:
+        # Export at the PADDED network input size (multiple of 64), matching
+        # what the C pipeline feeds the nets for that picture size.
+        if args.height is None or args.width is None:
+            parser.error('--height and --width must be given together')
+        global H, W, fH, fW, yH, yW, zH, zW
+        H = (args.height + 63) // 64 * 64
+        W = (args.width + 63) // 64 * 64
+        fH, fW = H // 8, W // 8
+        yH, yW = H // 16, W // 16
+        zH, zW = H // 64, W // 64
+        print(f'fixed-size export: picture {args.width}x{args.height} -> network input {W}x{H}')
 
     # Load model in FP32 on CPU (DepthConvBlock uses the torch path).
     net = DMC()
@@ -303,7 +342,8 @@ def main():
                             for (_, shape, _) in spec["inputs"])
         export_module(path, spec["module"], example,
                       [n for (n, _, _) in spec["inputs"]],
-                      spec["outputs"], spec["spatial"], spec["feature"])
+                      spec["outputs"], spec["spatial"], spec["feature"],
+                      fixed_size=fixed_size)
 
     # ---- Export 4 q-bank .npy files ----
     qbanks = [

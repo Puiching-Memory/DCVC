@@ -5,6 +5,11 @@ Replaces:
   Conv (group==1)               -> com.dcvc::FxpConvI8  (int8 act * int8 w, VNNI)
   Conv (group!=1, depthwise)    -> com.dcvc::FxpConv    (int16 fallback; i8 unsupported)
   Mul(x,4)->Sigmoid->Mul(s,x)   -> com.dcvc::FxpWsRelu  (65536-entry int16 LUT, unchanged)
+ 
+ Depthwise 3x3 convs (group==Cin==Cout) also use FxpConvI8: per-output-channel
+ int8 weights (9 taps each) with a dedicated SIMD oc-range kernel. The uint8
+ activation offset compensation (Wcomp=128*sum(W)) covers the 9 taps, and the
+ padded border carries 128 (=quantized 0 + offset) so border taps cancel exactly.
 
 FxpConvI8 formula (runtime):
     x_u8   = quantize(x, x_scale) + 128        (uint8 activation offset for VNNI)
@@ -103,15 +108,10 @@ def _make_fxp_conv_i8_node(x_name, w, b, xs, y_name, pads, strides, group,
 
 def _make_conv_node_dispatch(x_name, w, b, xs_i8, xs_i16, y_name, pads, strides,
                              group, uniq, new_inits, act_bits=16):
-    """group==1 -> FxpConvI8 (int8); group!=1 -> FxpConv (int16 fallback)."""
-    if group == 1:
-        return _make_fxp_conv_i8_node(
-            x_name, w, b, xs_i8, y_name, pads, strides, group, uniq, new_inits
-        )
-    # Depthwise / grouped conv: int8 op is group==1 only -> keep int16.
-    return _make_fxp_conv_node(
-        x_name, w, b, xs_i16, y_name, pads, strides, group, uniq, new_inits,
-        act_bits,
+    """All convs -> FxpConvI8 (int8). Depthwise 3x3 (group==Cin==Cout) and
+    standard 1x1/im2col paths are both handled by the C++ FxpConvI8 op."""
+    return _make_fxp_conv_i8_node(
+        x_name, w, b, xs_i8, y_name, pads, strides, group, uniq, new_inits
     )
 
 
@@ -255,17 +255,14 @@ def convert_model_int8(
                 )
                 n_split += 1
             else:
-                rebuilt.append(
-                    _make_conv_node_dispatch(
-                        x_name, w, b, xs_i8, xs_i16, y_name,
-                        pads, strides, group, uniq, new_inits,
-                    )
-                )
-                if group == 1:
-                    n_i8 += 1
-                else:
-                    n_i16 += 1
-            continue
+               rebuilt.append(
+                   _make_conv_node_dispatch(
+                       x_name, w, b, xs_i8, xs_i16, y_name,
+                       pads, strides, group, uniq, new_inits,
+                   )
+               )
+                n_i8 += 1
+           continue
 
         rebuilt.append(n)
 

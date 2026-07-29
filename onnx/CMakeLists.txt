@@ -10,16 +10,99 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Directory holding the runtime ONNX models + CDF tables.
-# onnx/models ships FIXED-POINT (fxp) networks by default: ALL 11 entropy nets
-# (7 intra + 4 inter) AND all 6 inter reconstruction/feature nets use integer
-# arithmetic (com.dcvc FxpConv/FxpWsRelu custom ops), which is cross-platform
-# bit-exact by construction (integer math is associative). This eliminates the
-# FP32 reference drift that caused entropy_sync desync between MSVC and GCC
-# ONNX Runtime builds. The original FP32 models are kept under onnx/models_fp32/
-# for RD comparison only.
-set(DCVC_ONNX_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models"
-    CACHE PATH "Directory with *.onnx models and *.npy CDF tables")
+# Keep every generated artifact below one predictable root. Toolchain-specific
+# tags prevent native MSVC and MinGW packages from overwriting each other.
+set(DCVC_OUTPUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/out" CACHE PATH
+    "Root for generated build-independent artifacts")
+if(MINGW)
+    set(_DCVC_DEFAULT_ARTIFACT_TAG "windows-x64-mingw")
+elseif(MSVC)
+    set(_DCVC_DEFAULT_ARTIFACT_TAG "windows-x64-msvc")
+else()
+    set(_DCVC_DEFAULT_ARTIFACT_TAG "linux-x64")
+endif()
+set(DCVC_ARTIFACT_TAG "${_DCVC_DEFAULT_ARTIFACT_TAG}" CACHE STRING
+    "Platform/toolchain tag used below DCVC_OUTPUT_ROOT/runnable")
+if(NOT DCVC_ARTIFACT_TAG MATCHES "^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    message(FATAL_ERROR "Invalid DCVC_ARTIFACT_TAG '${DCVC_ARTIFACT_TAG}'")
+endif()
+get_filename_component(DCVC_OUTPUT_ROOT "${DCVC_OUTPUT_ROOT}" ABSOLUTE
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set(DCVC_RUNNABLE_DIR
+    "${DCVC_OUTPUT_ROOT}/runnable/${DCVC_ARTIFACT_TAG}")
+message(STATUS "DCVC output root: ${DCVC_OUTPUT_ROOT}")
+
+# Runtime model packs included by dcvc_package. The value is a semicolon-
+# separated name=directory list. When empty, resolution directories matching
+# models_<digits>p (for example models_720p and models_2160p) are discovered.
+set(DCVC_ONNX_MODEL_PACKS "" CACHE STRING
+    "Model packs as name=directory entries; empty means discover models_<resolution>")
+
+set(_DCVC_MODEL_PACK_SPECS ${DCVC_ONNX_MODEL_PACKS})
+if(NOT _DCVC_MODEL_PACK_SPECS)
+    file(GLOB _DCVC_MODEL_PACK_CANDIDATES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+        LIST_DIRECTORIES true "${CMAKE_CURRENT_SOURCE_DIR}/models_*p")
+    foreach(_candidate IN LISTS _DCVC_MODEL_PACK_CANDIDATES)
+        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_candidate}"
+           AND _candidate MATCHES "^models_([0-9]+p)$")
+            list(APPEND _DCVC_MODEL_PACK_SPECS
+                "${CMAKE_MATCH_1}=${CMAKE_CURRENT_SOURCE_DIR}/${_candidate}")
+        endif()
+    endforeach()
+    list(SORT _DCVC_MODEL_PACK_SPECS COMPARE NATURAL)
+endif()
+set(_DCVC_MODEL_PACK_NAMES)
+set(_DCVC_MODEL_PACKAGE_COMMANDS)
+set(_DCVC_MODEL_CONTENTS "")
+set(_DCVC_MODEL_QUICK_TESTS "")
+if(NOT _DCVC_MODEL_PACK_SPECS)
+    message(WARNING
+        "No model packs found; library targets remain available, but "
+        "dcvc_package will fail. Create models_<resolution> or set "
+        "DCVC_ONNX_MODEL_PACKS=name=/path/to/models")
+    list(APPEND _DCVC_MODEL_PACKAGE_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E echo
+            "error: no DCVC model packs configured"
+        COMMAND ${CMAKE_COMMAND} -E false)
+endif()
+foreach(_spec IN LISTS _DCVC_MODEL_PACK_SPECS)
+    if(NOT _spec MATCHES "^([A-Za-z0-9][A-Za-z0-9._-]*)=(.+)$")
+        message(FATAL_ERROR "Invalid model pack '${_spec}'; expected name=directory")
+    endif()
+    set(_pack_name "${CMAKE_MATCH_1}")
+    set(_pack_dir "${CMAKE_MATCH_2}")
+    if(NOT IS_ABSOLUTE "${_pack_dir}")
+        get_filename_component(_pack_dir "${_pack_dir}" ABSOLUTE
+            BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    if(_pack_name IN_LIST _DCVC_MODEL_PACK_NAMES)
+        message(FATAL_ERROR "Duplicate model pack name '${_pack_name}'")
+    endif()
+    if(NOT EXISTS "${_pack_dir}/intra_analysis_standard.onnx")
+        message(FATAL_ERROR
+            "Model pack '${_pack_name}' is missing "
+            "${_pack_dir}/intra_analysis_standard.onnx")
+    endif()
+    list(APPEND _DCVC_MODEL_PACK_NAMES "${_pack_name}")
+    string(APPEND _DCVC_MODEL_CONTENTS
+        "  models/${_pack_name}/       neural-network models + CDF tables\n")
+    list(APPEND _DCVC_MODEL_PACKAGE_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${DCVC_RUNNABLE_DIR}/models/${_pack_name}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_pack_dir}"
+            "${DCVC_RUNNABLE_DIR}/models/${_pack_name}")
+    if(_pack_name STREQUAL "720p")
+        string(APPEND _DCVC_MODEL_QUICK_TESTS
+            "  Linux:    ./test_cpu_end2end models/720p 768 1280 32\n"
+            "  Windows:  test_cpu_end2end.exe models\\720p 768 1280 32\n")
+    elseif(_pack_name STREQUAL "1080p")
+        string(APPEND _DCVC_MODEL_QUICK_TESTS
+            "  Linux:    ./test_cpu_end2end models/1080p 1088 1920 32\n"
+            "  Windows:  test_cpu_end2end.exe models\\1080p 1088 1920 32\n")
+    endif()
+endforeach()
+message(STATUS "DCVC model packs: ${_DCVC_MODEL_PACK_NAMES}")
 
 # ---- Cross-platform compile flags ----
 if(MSVC)
@@ -127,6 +210,12 @@ add_library(dcvc_rans_cpu STATIC
 )
 target_include_directories(dcvc_rans_cpu PUBLIC
     ${DCVC_RANS_DIR}
+)
+set_target_properties(dcvc_rans_cpu PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    POSITION_INDEPENDENT_CODE ON
 )
 target_link_libraries(dcvc_rans_cpu PUBLIC Threads::Threads)
 if(NOT WIN32)
@@ -248,6 +337,112 @@ set(DCVC_INTER_PIPELINE_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu_inter_pipeline.c
 )
 
+# ===========================================================================
+# dcvc — commercial SDK shared library (public API in include/dcvc/).
+# Bundles the FXP fixed-point ops, rANS entropy codec, ONNX Runtime engine
+# and the intra/inter pipelines behind a stable C facade (sdk/).
+# ===========================================================================
+option(DCVC_BUILD_SDK "Build the libdcvc shared library + SDK package" ON)
+
+if(DCVC_BUILD_SDK)
+    set(DCVC_VERSION_MAJOR 1)
+    set(DCVC_VERSION_MINOR 0)
+    set(DCVC_VERSION_PATCH 0)
+    set(DCVC_SDK_SRCS
+        ${DCVC_INTER_PIPELINE_SRCS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdk/dcvc_facade.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdk/dcvc_container.c
+    )
+    add_library(dcvc SHARED ${DCVC_SDK_SRCS})
+    target_compile_definitions(dcvc PRIVATE DCVC_EXPORTS=1)
+
+    target_include_directories(dcvc
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rans
+            ${ORT_INCLUDE_DIR}
+    )
+
+    # CUDA backends for the FXP custom ops (optional, same gate as the tests).
+    if(DCVC_FXP_CUDA_ENABLED)
+        target_sources(dcvc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/fxp/fxp_cuda.cu)
+        target_compile_definitions(dcvc PRIVATE DCVC_FXP_CUDA=1)
+        target_link_libraries(dcvc PRIVATE CUDA::cudart)
+    endif()
+
+    target_link_libraries(dcvc PRIVATE dcvc_rans_cpu ${ORT_IMPLIB})
+    target_link_directories(dcvc PRIVATE ${ORT_LIB_DIR})
+    # MinGW: statically link the C/C++/pthread runtimes into the DLL so the
+    # resulting dcvc.dll has no libstdc++-6 / libgcc_s / libwinpthread deps
+    # (a Windows package then only needs onnxruntime.dll + the models).
+    if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU")
+        target_link_options(dcvc PRIVATE -static)
+    endif()
+    if(Threads_FOUND)
+        target_link_libraries(dcvc PRIVATE Threads::Threads)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(dcvc PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    set_target_properties(dcvc PROPERTIES
+        VERSION ${DCVC_VERSION_MAJOR}.${DCVC_VERSION_MINOR}.${DCVC_VERSION_PATCH}
+        SOVERSION ${DCVC_VERSION_MAJOR}
+        OUTPUT_NAME dcvc
+        CXX_VISIBILITY_PRESET hidden
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
+    # ---- install + exported CMake target + package ----------------------
+    include(GNUInstallDirs)
+    install(TARGETS dcvc
+        EXPORT dcvcTargets
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION include
+    )
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/dcvc
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+    )
+
+    install(EXPORT dcvcTargets
+        FILE dcvcTargets.cmake
+        NAMESPACE dcvc::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dcvc
+    )
+    include(CMakePackageConfigHelpers)
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/dcvcConfigVersion.cmake"
+        VERSION ${DCVC_VERSION_MAJOR}.${DCVC_VERSION_MINOR}.${DCVC_VERSION_PATCH}
+        COMPATIBILITY SameMajorVersion
+    )
+    configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/dcvcConfig.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/dcvcConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dcvc
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/dcvcConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/dcvcConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dcvc
+    )
+
+    # ---- example app, links the SDK shared library ----------------------
+    add_executable(dcvc_demo ${CMAKE_CURRENT_SOURCE_DIR}/examples/dcvc_demo.c)
+    target_link_libraries(dcvc_demo PRIVATE dcvc)
+    if(NOT WIN32)
+        target_link_libraries(dcvc_demo PRIVATE m)
+    endif()
+    set_target_properties(dcvc_demo PROPERTIES
+        BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()
+
 dcvc_onnx_add_executable(test_intra_analysis
     SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/onnx_engine.cpp
          ${DCVC_FXP_SRCS}
@@ -314,11 +509,9 @@ dcvc_onnx_add_executable(test_inter_one
 
 # ===========================================================================
 # `dcvc_package` target: assemble a ready-to-run folder (binaries + ORT lib
-# + models + CDF tables) under dist/dcvc_onnx_codec/. Works on Linux+Windows.
+# + models + CDF tables) under out/runnable/<platform>/.
+# Works on Linux and Windows without different toolchains clobbering each other.
 # ===========================================================================
-set(DCVC_DIST_ROOT "${CMAKE_SOURCE_DIR}/dist")
-set(DCVC_DIST_DIR "${DCVC_DIST_ROOT}/dcvc_onnx_codec")
-
 # Short run instructions dropped into the package root.
 file(WRITE "${CMAKE_BINARY_DIR}/README_PACKAGE.txt"
 "DCVC CPU ONNX codec - runnable package
@@ -326,45 +519,38 @@ file(WRITE "${CMAKE_BINARY_DIR}/README_PACKAGE.txt"
 Contents:
   *.exe / test_*   codec test executables
   onnxruntime.dll / libonnxruntime.so*   ONNX Runtime shared library
-  *.onnx / *.npy    neural-network models and entropy CDF tables
+${_DCVC_MODEL_CONTENTS}
 
-The executables auto-detect the model directory, so run them with no
-arguments from this folder:
-  Windows:  test_cpu_end2end.exe      (I-frame)
-            test_cpu_inter.exe      (I+P frame sequence)
-            test_ar_cpu.exe         (AR codec unit test)
-  Linux:    ./test_cpu_end2end      (I-frame)
-            ./test_cpu_inter        (I+P frame sequence)
-            ./test_ar_cpu           (AR codec unit test)
+Select the model pack that matches the input network resolution:
+${_DCVC_MODEL_QUICK_TESTS}
 
 Optional arguments override the defaults:
-  test_cpu_end2end[.exe] [model_dir] [H] [W] [qp]   (any H,W; default 256 256 32)
+  test_cpu_end2end[.exe] [model_dir] [H] [W] [qp]   (geometry must match pack)
   test_ar_cpu[.exe]      [model_dir] [H] [W]        (default 8 8)
 ")
 
 add_custom_target(dcvc_package
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${DCVC_DIST_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DCVC_DIST_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${DCVC_RUNNABLE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DCVC_RUNNABLE_DIR}"
     # Executables (generator expressions resolve the per-config output path).
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:test_intra_analysis>" "${DCVC_DIST_DIR}/"
+        "$<TARGET_FILE:test_intra_analysis>" "${DCVC_RUNNABLE_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:test_ar_cpu>" "${DCVC_DIST_DIR}/"
+        "$<TARGET_FILE:test_ar_cpu>" "${DCVC_RUNNABLE_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:test_cpu_end2end>" "${DCVC_DIST_DIR}/"
+        "$<TARGET_FILE:test_cpu_end2end>" "${DCVC_RUNNABLE_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:test_cpu_inter>" "${DCVC_DIST_DIR}/"
+        "$<TARGET_FILE:test_cpu_inter>" "${DCVC_RUNNABLE_DIR}/"
     # ONNX Runtime shared library (next to the binaries).
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${ORT_RUNTIME_LIBS} "${DCVC_DIST_DIR}/"
-    # Models + CDF tables.
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${DCVC_ONNX_MODEL_DIR}" "${DCVC_DIST_DIR}"
+        ${ORT_RUNTIME_LIBS} "${DCVC_RUNNABLE_DIR}/"
+    # Discovered/configured model packs + CDF tables.
+    ${_DCVC_MODEL_PACKAGE_COMMANDS}
     # Run instructions.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/README_PACKAGE.txt" "${DCVC_DIST_DIR}/"
+        "${CMAKE_BINARY_DIR}/README_PACKAGE.txt" "${DCVC_RUNNABLE_DIR}/"
     DEPENDS test_intra_analysis test_ar_cpu test_cpu_end2end test_cpu_inter
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "Assembling runnable package at ${DCVC_DIST_DIR}"
+    COMMENT "Assembling runnable package at ${DCVC_RUNNABLE_DIR}"
     VERBATIM
 )

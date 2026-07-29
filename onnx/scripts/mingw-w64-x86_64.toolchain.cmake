@@ -2,10 +2,10 @@
 # using the MinGW-w64 toolchain.
 #
 # Usage (from the repo root):
-#   cmake -S onnx -B onnx/build-mingw \
+#   cmake -S onnx -B onnx/out/build/windows-x64-mingw \
 #         -DCMAKE_TOOLCHAIN_FILE=onnx/scripts/mingw-w64-x86_64.toolchain.cmake
-#   cmake --build onnx/build-mingw -j$(nproc)
-#   cmake --build onnx/build-mingw --target dcvc_package
+#   cmake --build onnx/out/build/windows-x64-mingw -j$(nproc)
+#   cmake --build onnx/out/build/windows-x64-mingw --target dcvc_package
 #
 # Or use the convenience wrapper:  onnx/scripts/build_windows_cross.sh
 #

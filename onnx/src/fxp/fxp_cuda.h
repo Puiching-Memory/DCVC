@@ -24,7 +24,7 @@ int fxp_dwconv3x3_f32_cuda(const float* x, float* y,
                            const float* bias, float x_scale,
                            void* cuda_stream);
 
-/* Dispatches 1x1 / dw3x3; other shapes return -1 (caller must fallback). */
+/* Dispatches optimized 1x1 / dw3x3 kernels and a general grouped-conv kernel. */
 int fxp_conv_f32_cuda(const float* x, float* y,
                       int n, int cin, int cout, int h, int w,
                       const int16_t* w_int, const float* w_scale, const float* bias,

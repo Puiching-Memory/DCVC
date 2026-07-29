@@ -88,6 +88,28 @@ static void dw3x3_par_fn(void* usr, size_t task)
                                oc0, oc1);
 }
 
+struct Dw3x3I8Par {
+    const uint8_t* xq;
+    float* y;
+    int c, h, w, chunk;
+    const int8_t* w8;
+    const float* w_scale;
+    const int32_t* w_comp;
+    const float* bias;
+    float x_scale;
+};
+
+static void dw3x3_i8_par_fn(void* usr, size_t task)
+{
+    auto* j = (Dw3x3I8Par*)usr;
+    int oc0 = (int)task * j->chunk;
+    int oc1 = std::min(oc0 + j->chunk, j->c);
+    if (oc0 < oc1)
+        fxp_dw3x3_oc_range_i8(j->xq, j->y, j->c, j->h, j->w,
+                              j->w8, j->w_scale, j->w_comp, j->bias,
+                              j->x_scale, oc0, oc1);
+}
+
 struct Im2colPar {
     const int16_t* col;
     float* y;
@@ -245,6 +267,37 @@ static void conv_ws_par_fn(void* usr, size_t task)
     fxp_wsrelu_nchw_oc_range(j->y, j->hw, oc0, oc1, j->lut, j->wsrelu_x_scale);
 }
 
+struct ConvI8WsPar {
+    const uint8_t* xq;
+    float* y;
+    int cin, cout, hw, h, w, chunk;
+    int is_dw; /* 0=1x1, 1=dw3x3 */
+    const int8_t* w8;
+    const float* w_scale;
+    const int32_t* w_comp;
+    const float* bias;
+    float x_scale;
+    const float* lut;
+    float wsrelu_x_scale;
+};
+
+static void conv_i8_ws_par_fn(void* usr, size_t task)
+{
+    auto* j = (ConvI8WsPar*)usr;
+    int oc0 = (int)task * j->chunk;
+    int oc1 = std::min(oc0 + j->chunk, j->cout);
+    if (oc0 >= oc1) return;
+    if (j->is_dw)
+        fxp_dw3x3_oc_range_i8(j->xq, j->y, j->cout, j->h, j->w,
+                              j->w8, j->w_scale, j->w_comp, j->bias,
+                              j->x_scale, oc0, oc1);
+    else
+        fxp_conv1x1_oc_range_i8(j->xq, j->y, j->cin, j->cout, j->hw,
+                                j->w8, j->w_scale, j->w_comp, j->bias,
+                                j->x_scale, oc0, oc1);
+    fxp_wsrelu_nchw_oc_range(j->y, j->hw, oc0, oc1, j->lut, j->wsrelu_x_scale);
+}
+
 struct FxpConvWsReluKernel {
     float x_scale_;
     float wsrelu_x_scale_;
@@ -359,6 +412,119 @@ struct FxpConvWsReluOp : Ort::CustomOpBase<FxpConvWsReluOp, FxpConvWsReluKernel>
     {
         return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
     }
+};
+
+/* ── FxpConvI8WsRelu: fused FxpConvI8 + FxpWsRelu (int8 act × int8 weight + LUT).
+ * Inputs: [X(float), W(int8), B(float), Ws(float), Wcomp(int32), Lut(float[65536])]
+ * Same int8 conv math as FxpConvI8, with WsRelu applied in-place to the conv
+ * output channels (avoids the intermediate tensor round-trip through memory). */
+struct FxpConvI8WsReluKernel {
+    float x_scale_;
+    float wsrelu_x_scale_;
+    int64_t group_{};
+    int64_t pads_[4]{};
+    int64_t strides_[2]{};
+
+    FxpConvI8WsReluKernel(const OrtApi&, const OrtKernelInfo* info) : x_scale_(read_x_scale(info))
+    {
+        Ort::ConstKernelInfo ki(info);
+        try { wsrelu_x_scale_ = ki.GetAttribute<float>("wsrelu_x_scale"); }
+        catch (...) { wsrelu_x_scale_ = x_scale_; }
+        if (!(wsrelu_x_scale_ > 0.f)) wsrelu_x_scale_ = x_scale_;
+        group_ = 1;
+        try { group_ = ki.GetAttribute<int64_t>("group"); } catch (...) {}
+        auto pads = ki.GetAttributes<int64_t>("pads");
+        auto strides = ki.GetAttributes<int64_t>("strides");
+        if (pads.size() != 4 || strides.size() != 2)
+            ORT_CXX_API_THROW("FxpConvI8WsRelu: pads/strides", ORT_INVALID_ARGUMENT);
+        for (int i = 0; i < 4; i++) pads_[i] = pads[i];
+        strides_[0] = strides[0]; strides_[1] = strides[1];
+        if (group_ < 1) group_ = 1;
+    }
+
+    void Compute(OrtKernelContext* context)
+    {
+        Ort::KernelContext ctx(context);
+        auto X = ctx.GetInput(0);
+        auto W = ctx.GetInput(1);
+        auto B = ctx.GetInput(2);
+        auto Ws = ctx.GetInput(3);
+        auto Wcomp = ctx.GetInput(4);
+        auto Lut = ctx.GetInput(5);
+        auto shape = X.GetTensorTypeAndShapeInfo().GetShape();
+        auto w_shape = W.GetTensorTypeAndShapeInfo().GetShape();
+        auto lut_shape = Lut.GetTensorTypeAndShapeInfo().GetShape();
+        if (shape.size() != 4 || w_shape.size() != 4)
+            ORT_CXX_API_THROW("FxpConvI8WsRelu: bad rank", ORT_INVALID_ARGUMENT);
+        int64_t lut_n = 1;
+        for (auto d : lut_shape) lut_n *= d;
+        if (lut_n != 65536)
+            ORT_CXX_API_THROW("FxpConvI8WsRelu: LUT must have 65536 entries", ORT_INVALID_ARGUMENT);
+
+        const int N = (int)shape[0], Cin = (int)shape[1], H = (int)shape[2], Ww = (int)shape[3];
+        const int Cout = (int)w_shape[0], kh = (int)w_shape[2], kw = (int)w_shape[3];
+        const int pad_t = (int)pads_[0], pad_l = (int)pads_[1], pad_b = (int)pads_[2], pad_r = (int)pads_[3];
+        const int sh = (int)strides_[0], sw = (int)strides_[1];
+        const int oh = (H + pad_t + pad_b - kh) / sh + 1;
+        const int ow = (Ww + pad_l + pad_r - kw) / sw + 1;
+        auto Y = ctx.GetOutput(0, std::vector<int64_t>{N, Cout, oh, ow});
+
+        const float* xp = X.GetTensorData<float>();
+        float* yp = Y.GetTensorMutableData<float>();
+        const int8_t* w8p = W.GetTensorData<int8_t>();
+        const float* wsp = Ws.GetTensorData<float>();
+        const float* bp = B.GetTensorData<float>();
+        const int32_t* wcomp = Wcomp.GetTensorData<int32_t>();
+        const float* lut = Lut.GetTensorData<float>();
+
+        const int is_1x1 = (kh == 1 && kw == 1 && group_ == 1
+            && pad_t == 0 && pad_l == 0 && pad_b == 0 && pad_r == 0
+            && sh == 1 && sw == 1);
+        const int is_dw = (kh == 3 && kw == 3 && group_ == Cin && Cin == Cout
+            && pad_t == 1 && pad_l == 1 && pad_b == 1 && pad_r == 1
+            && sh == 1 && sw == 1);
+        if (!is_1x1 && !is_dw)
+            ORT_CXX_API_THROW("FxpConvI8WsRelu: only 1x1 or dw3x3 fused", ORT_INVALID_ARGUMENT);
+
+        const int hw = H * Ww;
+        const int ntasks = parallel_tasks(Cout, is_dw ? 4 : 8);
+        const int chunk = (Cout + ntasks - 1) / ntasks;
+        for (int ni = 0; ni < N; ni++) {
+            const float* x_n = xp + (size_t)ni * Cin * hw;
+            float* y_n = yp + (size_t)ni * Cout * hw;
+            if (is_dw) {
+                const int Wpad = Ww + 2;
+                std::vector<uint8_t> xq8((size_t)Cin * (size_t)(H + 2) * (size_t)Wpad);
+                fxp_dw3x3_pack_i8(x_n, xq8.data(), Cin, H, Ww, x_scale_);
+                ConvI8WsPar job{xq8.data(), y_n, Cin, Cout, hw, H, Ww, chunk, 1,
+                                w8p, wsp, wcomp, bp, x_scale_, lut, wsrelu_x_scale_};
+                ctx.ParallelFor(conv_i8_ws_par_fn, (size_t)ntasks, 0, &job);
+            } else {
+                std::vector<uint8_t> xq8((size_t)Cin * (size_t)hw);
+                fxp_conv1x1_pack_i8(x_n, xq8.data(), Cin, hw, x_scale_);
+                ConvI8WsPar job{xq8.data(), y_n, Cin, Cout, hw, H, Ww, chunk, 0,
+                                w8p, wsp, wcomp, bp, x_scale_, lut, wsrelu_x_scale_};
+                ctx.ParallelFor(conv_i8_ws_par_fn, (size_t)ntasks, 0, &job);
+            }
+        }
+    }
+};
+
+struct FxpConvI8WsReluOp : Ort::CustomOpBase<FxpConvI8WsReluOp, FxpConvI8WsReluKernel> {
+    void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const
+    { return new FxpConvI8WsReluKernel(api, info); }
+    const char* GetName() const { return "FxpConvI8WsRelu"; }
+    const char* GetExecutionProviderType() const { return "CPUExecutionProvider"; }
+    size_t GetInputTypeCount() const { return 6; }
+    ONNXTensorElementDataType GetInputType(size_t i) const
+    {
+        if (i == 1) return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+        if (i == 4) return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+        return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+    }
+    size_t GetOutputTypeCount() const { return 1; }
+    ONNXTensorElementDataType GetOutputType(size_t) const
+    { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
 };
 
 struct FxpConv1x1Op : Ort::CustomOpBase<FxpConv1x1Op, FxpConv1x1Kernel> {
@@ -613,8 +779,27 @@ struct FxpConvI8Kernel {
                 ctx.ParallelFor(im2col_i8_par_fn, (size_t)ntasks, 0, &job);
             }
             return;
+       }
+        /* int8 depthwise 3x3 (group==Cin==Cout, pads=[1,1,1,1], stride=1) */
+        const int is_dw = (kh == 3 && kw == 3 && group_ == Cin && Cin == Cout
+            && pad_t == 1 && pad_l == 1 && pad_b == 1 && pad_r == 1
+            && sh == 1 && sw == 1);
+        if (is_dw) {
+            const int Wpad = Ww + 2;
+            std::vector<uint8_t> xq8((size_t)Cin * (size_t)(H + 2) * (size_t)Wpad);
+            const int ntasks = parallel_tasks(Cout, 4);
+            const int chunk = (Cout + ntasks - 1) / ntasks;
+            for (int ni = 0; ni < N; ni++) {
+                const float* x_n = xp + (size_t)ni * Cin * hw;
+                float* y_n = yp + (size_t)ni * Cout * hw;
+                fxp_dw3x3_pack_i8(x_n, xq8.data(), Cin, H, Ww, x_scale_);
+                Dw3x3I8Par job{xq8.data(), y_n, Cin, H, Ww, chunk,
+                               w8p, wsp, wcomp, bp, x_scale_};
+                ctx.ParallelFor(dw3x3_i8_par_fn, (size_t)ntasks, 0, &job);
+            }
+            return;
         }
-        ORT_CXX_API_THROW("FxpConvI8: only group==1 supported", ORT_INVALID_ARGUMENT);
+        ORT_CXX_API_THROW("FxpConvI8: unsupported shape (need 1x1, dw3x3, or general group==1)", ORT_INVALID_ARGUMENT);
     }
 };
 
@@ -790,6 +975,7 @@ static FxpConvOp g_fxp_conv;
 static FxpConvI8Op g_fxp_conv_i8;
 static FxpWsReluOp g_fxp_wsrelu;
 static FxpConvWsReluOp g_fxp_conv_wsrelu;
+static FxpConvI8WsReluOp g_fxp_conv_i8_wsrelu;
 
 #if defined(DCVC_FXP_CUDA)
 
@@ -961,9 +1147,98 @@ struct FxpWsReluCudaOp : Ort::CustomOpBase<FxpWsReluCudaOp, FxpWsReluCudaKernel>
     }
 };
 
+struct FxpConvWsReluCudaKernel {
+    float x_scale_;
+    float wsrelu_x_scale_;
+    int act_bits_;
+    int64_t group_;
+    int64_t pads_[4];
+    int64_t strides_[2];
+
+    FxpConvWsReluCudaKernel(const OrtApi&, const OrtKernelInfo* info)
+        : x_scale_(read_x_scale(info))
+    {
+        Ort::ConstKernelInfo ki(info);
+        try { wsrelu_x_scale_ = ki.GetAttribute<float>("wsrelu_x_scale"); }
+        catch (...) { wsrelu_x_scale_ = x_scale_; }
+        if (!(wsrelu_x_scale_ > 0.f)) wsrelu_x_scale_ = x_scale_;
+        group_ = 1;
+        try { group_ = ki.GetAttribute<int64_t>("group"); } catch (...) {}
+        auto pads = ki.GetAttributes<int64_t>("pads");
+        auto strides = ki.GetAttributes<int64_t>("strides");
+        if (pads.size() != 4 || strides.size() != 2)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA: pads/strides", ORT_INVALID_ARGUMENT);
+        for (int i = 0; i < 4; i++) pads_[i] = pads[i];
+        strides_[0] = strides[0];
+        strides_[1] = strides[1];
+        if (group_ < 1) group_ = 1;
+        act_bits_ = 16;
+        try { act_bits_ = (int)ki.GetAttribute<int64_t>("act_bits"); } catch (...) {}
+    }
+
+    void Compute(OrtKernelContext* context)
+    {
+        Ort::KernelContext ctx(context);
+        auto X = ctx.GetInput(0);
+        auto W = ctx.GetInput(1);
+        auto B = ctx.GetInput(2);
+        auto Ws = ctx.GetInput(3);
+        auto Lut = ctx.GetInput(4);
+        auto shape = X.GetTensorTypeAndShapeInfo().GetShape();
+        auto w_shape = W.GetTensorTypeAndShapeInfo().GetShape();
+        auto lut_shape = Lut.GetTensorTypeAndShapeInfo().GetShape();
+        if (shape.size() != 4 || w_shape.size() != 4)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA: bad rank", ORT_INVALID_ARGUMENT);
+        int64_t lut_n = 1;
+        for (auto d : lut_shape) lut_n *= d;
+        if (lut_n != 65536)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA: LUT must have 65536 entries", ORT_INVALID_ARGUMENT);
+        if (act_bits_ != 16)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA: only act_bits=16 supported", ORT_INVALID_ARGUMENT);
+
+        const int N = (int)shape[0], Cin = (int)shape[1];
+        const int H = (int)shape[2], Ww = (int)shape[3];
+        const int Cout = (int)w_shape[0], kh = (int)w_shape[2], kw = (int)w_shape[3];
+        const int pad_t = (int)pads_[0], pad_l = (int)pads_[1];
+        const int pad_b = (int)pads_[2], pad_r = (int)pads_[3];
+        const int sh = (int)strides_[0], sw = (int)strides_[1];
+        const int oh = (H + pad_t + pad_b - kh) / sh + 1;
+        const int ow = (Ww + pad_l + pad_r - kw) / sw + 1;
+        auto Y = ctx.GetOutput(0, std::vector<int64_t>{N, Cout, oh, ow});
+        void* stream = ctx.GetGPUComputeStream();
+        int rc = fxp_conv_f32_cuda(X.GetTensorData<float>(), Y.GetTensorMutableData<float>(),
+                                   N, Cin, Cout, H, Ww,
+                                   W.GetTensorData<int16_t>(), Ws.GetTensorData<float>(),
+                                   B.GetTensorData<float>(), x_scale_, kh, kw,
+                                   pad_t, pad_l, pad_b, pad_r, sh, sw, (int)group_, stream);
+        if (rc)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA convolution failed", ORT_FAIL);
+        rc = fxp_wsrelu_f32_cuda(Y.GetTensorData<float>(), Y.GetTensorMutableData<float>(),
+                                 N * Cout * oh * ow, Lut.GetTensorData<float>(),
+                                 wsrelu_x_scale_, stream);
+        if (rc)
+            ORT_CXX_API_THROW("FxpConvWsRelu CUDA activation failed", ORT_FAIL);
+    }
+};
+
+struct FxpConvWsReluCudaOp
+    : Ort::CustomOpBase<FxpConvWsReluCudaOp, FxpConvWsReluCudaKernel> {
+    void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const
+    { return new FxpConvWsReluCudaKernel(api, info); }
+    const char* GetName() const { return "FxpConvWsRelu"; }
+    const char* GetExecutionProviderType() const { return "CUDAExecutionProvider"; }
+    size_t GetInputTypeCount() const { return 5; }
+    ONNXTensorElementDataType GetInputType(size_t i) const
+    { return i == 1 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
+    size_t GetOutputTypeCount() const { return 1; }
+    ONNXTensorElementDataType GetOutputType(size_t) const
+    { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
+};
+
 static FxpConv1x1CudaOp g_fxp_conv1x1_cuda;
 static FxpConvCudaOp g_fxp_conv_cuda;
 static FxpWsReluCudaOp g_fxp_wsrelu_cuda;
+static FxpConvWsReluCudaOp g_fxp_conv_wsrelu_cuda;
 
 #endif  // DCVC_FXP_CUDA
 
@@ -981,8 +1256,10 @@ static void init_domain(const OrtApi* api)
     }
     const OrtCustomOp* ops[] = {
         &g_det_conv, &g_fxp_conv1x1, &g_fxp_conv, &g_fxp_conv_i8, &g_fxp_wsrelu, &g_fxp_conv_wsrelu,
+        &g_fxp_conv_i8_wsrelu,
 #if defined(DCVC_FXP_CUDA)
         &g_fxp_conv1x1_cuda, &g_fxp_conv_cuda, &g_fxp_wsrelu_cuda,
+        &g_fxp_conv_wsrelu_cuda,
 #endif
     };
     for (auto* op : ops) {

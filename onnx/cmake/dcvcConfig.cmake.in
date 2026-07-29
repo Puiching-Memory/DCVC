@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+# DCVC-SDK — exported CMake package.
+#
+#   find_package(dcvc 1.0 CONFIG REQUIRED)
+#   target_link_libraries(myapp PRIVATE dcvc::dcvc)
+#
+# The headers are found via the target's INCLUDES destination; no extra
+# include_directories call is needed. The shared library + ORT runtime must be
+# on the loader path at run time (see the package README).
+
+include("${CMAKE_CURRENT_LIST_DIR}/dcvcTargets.cmake")
+
+check_required_components(dcvc)

@@ -55,6 +55,19 @@ void fxp_conv_im2col_oc_range_i8(const uint8_t* col, float* y_nchw,
                                  float x_scale, int kh, int kw,
                                  int oc_start, int oc_end);
 
+/* Depthwise 3x3 (int8): pack NCHW float into a PADDED uint8 layout [c][h+2][w+2]
+ * (row stride = w+2). CRITICAL: out-of-bounds cells MUST be 128 (NOT 0), because
+ * the uint8 activation = int8_act + 128, so a true-0 activation offsets to 128.
+ * The w8_comp subtraction (128*sum(weights)) assumes every one of the 9 taps
+ * carries the +128 offset, which only holds if border cells are 128. */
+void fxp_dw3x3_pack_i8(const float* x_nchw, uint8_t* xq_pad,
+                       int c, int h, int w, float x_scale);
+void fxp_dw3x3_oc_range_i8(const uint8_t* xq_pad, float* y_nchw,
+                           int c, int h, int w,
+                           const int8_t* w8, const float* w8_scale,
+                           const int32_t* w8_comp, const float* bias,
+                           float x_scale, int oc_start, int oc_end);
+
 /* --- im2col API (general k×k group=1 conv; for multi-thread ORT) ---
  * 1) fxp_conv_im2col_build: quantize float input + build [oh*ow][cin*kh*kw] int16 col
  * 2) fxp_conv_im2col_oc_range: SIMD GEMM over oc in [oc_start, oc_end)

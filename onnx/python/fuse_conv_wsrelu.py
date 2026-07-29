@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Fuse adjacent FxpConv -> FxpWsRelu node pairs into a single FxpConvWsRelu
-custom op (com.dcvc domain).
+"""Fuse adjacent conv -> FxpWsRelu node pairs into a single fused custom op
+(com.dcvc domain).
+
+Two conv variants are supported (same domain ``com.dcvc``):
+  * FxpConv   (int16) -> FxpConvWsRelu   inputs [X, W, B, Ws, Lut]
+  * FxpConvI8 (int8)  -> FxpConvI8WsRelu inputs [X, W, B, Ws, Wcomp, Lut]
 
 This is a PURE GRAPH REWRITE: no re-quantization or calibration is performed,
 so the fused graph computes bit-identical values to the unfused one (the C++
-FxpConvWsRelu kernel runs the exact same conv + wsrelu math, just without the
+fused kernel runs the exact same conv + wsrelu math, just without the
 intermediate tensor round-trip through main memory).
 
 A pair (conv, wsrelu) is fusible iff:
-  * wsrelu.input[0] is produced by a FxpConv node, AND
+  * wsrelu.input[0] is produced by a FxpConv / FxpConvI8 node, AND
   * that conv output has exactly ONE consumer (the wsrelu) -- not shared with
     any other node or a graph output, AND
   * the conv matches one of the C++ kernel's fast paths:
@@ -35,6 +39,15 @@ FUSED_OP = "FxpConvWsRelu"
 DOMAIN = "com.dcvc"
 # conv attributes to copy verbatim onto the fused node
 CONV_ATTRS = ("group", "pads", "strides", "x_scale", "act_bits")
+
+# Conv variants that can be fused with a trailing FxpWsRelu.  Each entry maps
+# conv op_type -> (fused_op_name, n_conv_inputs).  The fused node receives the
+# first ``n_conv_inputs`` conv inputs verbatim, followed by the wsrelu LUT
+# (ws.input[1]).  wsrelu_x_scale and CONV_ATTRS are identical for both.
+CONV_FUSION = {
+    "FxpConv":   ("FxpConvWsRelu", 4),    # [X, W, B, Ws]
+    "FxpConvI8": ("FxpConvI8WsRelu", 5),  # [X, W, B, Ws, Wcomp]
+}
 
 
 def _attr_value_int(node, name, default):
@@ -116,7 +129,7 @@ def fuse_model(model):
             continue
         src = ws.input[0]
         conv = producers.get(src)
-        if conv is None or conv.op_type != CONV_OP:
+        if conv is None or conv.op_type not in CONV_FUSION:
             continue
         if counts.get(src, 0) != 1:
             continue  # conv output shared -> skip
@@ -137,6 +150,7 @@ def fuse_model(model):
             continue
         if id(n) in fuse_conv:
             ws = fuse_conv[id(n)]
+            fused_op, n_conv_inputs = CONV_FUSION[n.op_type]
             # copy raw conv attributes verbatim (preserves INT/INTS/FLOAT types)
             attrs = []
             for a in n.attribute:
@@ -147,8 +161,8 @@ def fuse_model(model):
                                     _attr_value_float(n, "x_scale"))
             attrs.append(helper.make_attribute("wsrelu_x_scale", float(wsx)))
 
-            inputs = [n.input[0], n.input[1], n.input[2], n.input[3],
-                      ws.input[1]]
+            # conv inputs forwarded verbatim, then the wsrelu LUT
+            inputs = list(n.input[:n_conv_inputs]) + [ws.input[1]]
             base = n.name or ws.name or "fxp_conv_wsrelu"
             name = base + "_fused"
             i = 1
@@ -158,7 +172,7 @@ def fuse_model(model):
             used_names.add(name)
 
             fused_node = helper.make_node(
-                FUSED_OP, inputs=inputs, outputs=[ws.output[0]],
+                fused_op, inputs=inputs, outputs=[ws.output[0]],
                 name=name, domain=DOMAIN)
             fused_node.attribute.extend(attrs)
             new_nodes.append(fused_node)
@@ -255,8 +269,10 @@ def main():
     for c in scan.values():
         for op, k in c.items():
             agg[op] = agg.get(op, 0) + k
-    keep = {k: v for k, v in sorted(agg.items())
-            if k in (CONV_OP, WSRELU_OP, FUSED_OP)}
+    report_ops = ({CONV_OP, WSRELU_OP, FUSED_OP}
+                  | set(CONV_FUSION)
+                  | {fused_op for fused_op, _ in CONV_FUSION.values()})
+    keep = {k: v for k, v in sorted(agg.items()) if k in report_ops}
     print("models_fused op counts:", keep)
     return 0
 
