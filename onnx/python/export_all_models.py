@@ -90,6 +90,58 @@ def export_torch(net, args, path, in_names, out_name, fixed_size=False):
     print('exported', path)
 
 
+def _remap_cdf_assets(out_dir, cdf_src):
+    """Remap the gaussian / bit-estimator CDFs from DCVC-RT offset-centred
+    order to DCVC-UF zigzag order (value = |sym|*2-(sym>0), symbol 0 at CDF
+    index 0). Writes zigzag-ordered *_cdf.npy / *_cdf_length.npy and drops the
+    *_offset.npy files (zigzag has no offset; the C runtime ignores offset)."""
+    import numpy as np
+    SCALE = 1 << 16  # CDF precision used by the rANS codec
+    pairs = [('gaussian', 'gaussian_offset'), ('bitest', 'bitest_offset')]
+    for stem, off_stem in pairs:
+        cdf_path = os.path.join(cdf_src, stem + '_cdf.npy')
+        len_path = os.path.join(cdf_src, stem + '_cdf_length.npy')
+        if not os.path.exists(cdf_path):
+            print('warning: missing', cdf_path); continue
+        cdf = np.load(cdf_path)        # [qp_num, max_len]
+        clen = np.load(len_path)       # [qp_num]
+        qp_num, max_len = cdf.shape
+        zig_cdf = np.zeros_like(cdf)
+        for q in range(qp_num):
+            L = int(clen[q])           # number of CDF entries (incl. escape)
+            max_value = L - 2          # escape triggers when value >= max_value
+            # RT offset order: CDF entry i is symbol (offset? no) — RT builds the
+            # gaussian CDF symmetric around its centre. The escape (largest
+            # magnitude) sits at the LAST real interval. We rebuild the zigzag
+            # pmf by walking RT symbols [-sym_range .. +sym_range] (+escape).
+            sym_range = (L - 3) // 2    # RT stores 2*sym_range+1 symbols + escape + cdf terminal
+            # pmf of each CDF interval (length L-1 intervals over the L entries)
+            pmf = np.diff(cdf[q, :L]).astype(np.int64)
+            # RT interval i -> symbol = i - sym_range; the final interval is escape
+            zig = np.zeros(L, dtype=np.int64)
+            for i in range(len(pmf)):
+                s = i - sym_range
+                if i == len(pmf) - 1:
+                    # escape interval: belongs at max_value (the UF escape slot)
+                    z = max_value
+                else:
+                    z = abs(s) * 2 - (1 if s > 0 else 0)
+                    if z >= max_value:
+                        z = max_value
+                zig[z] += pmf[i]
+            zig_cdf[q, 0] = 0
+            for i in range(1, L):
+                zig_cdf[q, i] = zig_cdf[q, i - 1] + zig[i - 1]
+            zig_cdf[q, L:] = SCALE      # pad tail to full precision
+        np.save(os.path.join(out_dir, stem + '_cdf.npy'), zig_cdf)
+        np.save(os.path.join(out_dir, stem + '_cdf_length.npy'), clen)
+        # write a zero offset array for backward compat (the C runtime still
+        # accepts an offset argument but ignores it under zigzag)
+        np.save(os.path.join(out_dir, stem + '_offset.npy'),
+                np.zeros(qp_num, dtype=cdf.dtype))
+        print('remapped', stem, 'CDF -> zigzag order')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out-dir', default=os.path.join(ROOT, 'onnx', 'models'))
@@ -161,17 +213,12 @@ def main():
     np.save(os.path.join(out_dir, 'q_scale_y_dec.npy'), model.q_scale_y_dec.detach().cpu().numpy())
     print('saved q_scale_enc/dec + q_scale_y_enc/dec .npy')
 
-    # CDF tables from tensorRT assets
-    cdf_src = os.path.join(ROOT, 'tensorRT', 'assets', 'decode')
-    for name in ['gaussian_cdf.npy', 'gaussian_cdf_length.npy', 'gaussian_offset.npy',
-                 'bitest_cdf.npy', 'bitest_cdf_length.npy', 'bitest_offset.npy']:
-        src_path = os.path.join(cdf_src, name)
-        dst_path = os.path.join(out_dir, name)
-        if os.path.exists(src_path):
-            shutil.copy(src_path, dst_path)
-            print('copied', name)
-        else:
-            print('warning: missing', src_path)
+    # CDF tables in DCVC-UF zigzag order. The legacy RT assets store the CDFs in
+    # offset-centred order (peak in the middle, offset = -sym_range); the UF
+    # rANS uses value = |sym|*2-(sym>0), so symbol 0 must sit at CDF index 0.
+    # We remap the per-QP gaussian / bit-estimator CDFs from offset order to
+    # zigzag order here and drop the *_offset arrays (zigzag has no offset).
+    _remap_cdf_assets(out_dir, os.path.join(ROOT, 'tensorRT', 'assets', 'decode'))
 
     print('All models and data exported to', out_dir)
 

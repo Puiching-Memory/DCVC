@@ -112,15 +112,16 @@ FORCE_INLINE void RansEncoderLib::encode_one_symbol(uint8_t*& ptr, RansState& ra
                                                     const int32_t cdf_size, const int32_t offset,
                                                     const std::vector<RansSymbol>& ransSymbols)
 {
+    /* DCVC-UF zigzag symbol mapping (matches src/cpp/py_rans/rans.cpp):
+     * value = |sym|*2 - (sym>0), so CDF index 0 == symbol 0 and amplitude grows
+     * outward. `offset` is accepted for API compatibility but ignored (zigzag
+     * has no offset). CDFs must be supplied in zigzag order by the caller. */
     const int32_t max_value = cdf_size - 2;
-    int32_t value = symbol - offset;
+    int32_t value = abs(symbol) * 2 - (symbol > 0);
 
     uint32_t raw_val = 0;
-    if (value < 0) {
-        raw_val = -2 * value - 1;
-        value = max_value;
-    } else if (value >= max_value) {
-        raw_val = 2 * (value - max_value);
+    if (value >= max_value) {
+        raw_val = value - max_value;
         value = max_value;
     }
 
@@ -434,17 +435,16 @@ FORCE_INLINE int8_t RansDecoderLib::decode_one_symbol(const int32_t* cdf, const 
         for (int j = 0; j < n_bypass; ++j) {
             if (!RansDecGetBitsSafe(_rans, _ptr8, _stream_end, bits)) { _error = true; return 0; }
             val = static_cast<int32_t>(bits);
-            raw_val |= val << (j * bypass_precision);
+        raw_val |= val << (j * bypass_precision);
         }
-        value = raw_val >> 1;
-        if (raw_val & 1) {
-            value = -value - 1;
-        } else {
-            value += max_value;
-        }
+        /* UF zigzag bypass: value = raw_val + max_value, then fold back to the
+         * signed symbol at the very end. */
+        value = raw_val + max_value;
     }
 
-    return static_cast<int8_t>(value + offset);
+    /* inverse zigzag: value even -> -(value/2); odd -> (value+1)/2. (offset is
+     * accepted for API compat but unused — zigzag has no offset.) */
+    return static_cast<int8_t>((value % 2 == 1) ? (value + 1) / 2 : -(value + 1) / 2);
 }
 
 void RansDecoderLib::decode_y(const std::shared_ptr<std::vector<uint8_t>> indexes,

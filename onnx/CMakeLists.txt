@@ -507,6 +507,10 @@ dcvc_onnx_add_executable(test_inter_one
     SRCS ${DCVC_INTER_PIPELINE_SRCS}
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_inter_one.cpp)
 
+dcvc_onnx_add_executable(test_rans_xop
+    SRCS ${DCVC_NPY_SRC}
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rans_xop.cpp)
+
 # ===========================================================================
 # `dcvc_package` target: assemble a ready-to-run folder (binaries + ORT lib
 # + models + CDF tables) under out/runnable/<platform>/.

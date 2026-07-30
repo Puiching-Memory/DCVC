@@ -1,0 +1,55 @@
+# Pinned Python dependencies for the DCVC ONNX codec (onnx/).
+#
+# This sub-project needs its OWN virtualenv (onnx/.venv), separate from the
+# main repo venv. Model export relies on torch 2.13 `dynamic_shapes`, which the
+# main repo venv (torch 2.4) does not support.
+#
+# The versions below are the exact set validated for the DCVC-UF HT migration
+# (intra + HT-S/HT-L inter, zigzag rANS). Recreate the env with:
+#
+#     cd onnx && python3 -m venv .venv
+#     .venv/bin/pip install --upgrade pip
+#     .venv/bin/pip install torch==2.13.0+cpu \
+#         --index-url https://download.pytorch.org/whl/cpu
+#     .venv/bin/pip install -e .            # pulls the rest from PyPI
+#
+# NOTE: CPU torch wheels live on the PyTorch index, not PyPI, so install torch
+# first with the index URL above; the remaining packages then resolve from PyPI.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcvc-onnx-codec"
+version = "0.1.0"
+description = "DCVC-UF HT ONNX codec: model export, zigzag rANS, C++ interop tests"
+requires-python = ">=3.11"
+dependencies = [
+    # --- model export (dynamo export + dynamic_shapes) ---
+    "torch==2.13.0+cpu",
+    "onnxscript==0.7.1",
+    "onnx==1.22.0",
+    # --- ONNX Runtime (Python side: quantization / calibration) ---
+    # The C++ pipeline links ORT 1.27.0; the Python 1.28.0 here is validated
+    # for export only and is opset-compatible with the C++ build.
+    "onnxruntime==1.28.0",
+    # --- numerics ---
+    "numpy==2.5.1",
+    "scipy==1.18.0",
+    # --- C++ py_rans extension build ---
+    "pybind11==3.0.4",
+]
+
+[project.optional-dependencies]
+# Fixed-point entropy-net export + calibration data + hyperparameter search.
+# NOT required for the core I-frame / P-chunk model export; unverified in the
+# base env, so only lower bounds are pinned.
+fxp = [
+    "pillow>=10",
+    "optuna>=3.6",
+]
+
+[tool.setuptools]
+# Pure dependency lock: nothing is packaged for import.
+py-modules = []

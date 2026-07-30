@@ -12,7 +12,6 @@ native runtime, so the pipeline is fully independent of TensorRT.
 
 > **Migration status.** The codec was ported from DCVC-RT (sequential P-frames)
 > to DCVC-UF **HT** (chunk-based). Both HT variants (**HT-S** means-only and
-> to DCVC-UF **HT** (chunk-based). Both HT variants (**HT-S** means-only and
 > **HT-L** scales+means spatial prior) are implemented end-to-end and
 > **numerically validated against the PyTorch reference** with the real
 > `cvpr2026` checkpoints:
@@ -24,6 +23,14 @@ native runtime, so the pipeline is fully independent of TensorRT.
 >
 > All three `cvpr2026` checkpoints (`image`, `video_hts`, `video_htl`) are
 > present and load with 0 missing / 0 unexpected keys.
+>
+> **Entropy coder (rANS) is now UF-aligned.** The C rANS codec in `rans/` was
+> moved from the DCVC-RT *offset* symbol layout to the DCVC-UF *zigzag* layout
+> (`symbol 0 -> CDF index 0`, expanding outward), and the export script remaps
+> the `gaussian`/`bitest` CDF tables into zigzag order (zeroing the legacy
+> offset arrays). The produced bitstream is therefore **byte-for-byte
+> interoperable** with the official DCVC-UF `py_rans` entropy coder, verified
+> both directions with `test_rans_xop` (see "rANS interop test" below).
 
 ## Directory layout
 
@@ -59,7 +66,17 @@ in FP32 with no custom-op registration.
   - `-DDCVC_ORT_URL=https://.../onnxruntime-*.zip` — a full custom URL
 
 **Regenerating models** (optional — `models/` ships pre-generated)
-- Python 3 with `torch`, `onnx`, `numpy` (run via `uv` or `pip`).
+- A **dedicated Python env** for `onnx/`. Export uses
+  `torch.onnx.export(..., dynamic_shapes=...)`, which needs **torch >= 2.13**;
+  the main repo venv (torch 2.4) cannot do the export. Create one under
+  `onnx/.venv` (git-ignored) using the version lock in `onnx/pyproject.toml`:
+  ```bash
+  cd onnx && python3 -m venv .venv && .venv/bin/pip install --upgrade pip
+  # CPU torch wheels are on the PyTorch index, not PyPI -> install first:
+  .venv/bin/pip install torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu
+  # then the remaining pinned deps (onnx/onnxruntime/numpy/scipy/...) from PyPI:
+  .venv/bin/pip install -e .           # reads pyproject.toml
+  ```
 
 ## Build
 
@@ -147,7 +164,7 @@ lookup — no runtime `logf`/`floorf`. Encode and decode both call this path.
 (The FP32 nets are in `models_fp32/` for RD comparison only.)
 ```bash
 # Regenerate the fxp nets into a directory (real-content activation calibration):
-uv run python python/fxp_export_entropy_nets.py --calib-dir <calib> --out-dir models_fxp
+.venv/bin/python python/fxp_export_entropy_nets.py --calib-dir <calib> --out-dir models_fxp
 cmake --build out/build/linux-x64 --target test_fxp_scale_index test_cpu_end2end
 ./out/build/linux-x64/test_fxp_scale_index
 ./out/build/linux-x64/test_cpu_end2end models_fxp 128 128 32
@@ -319,11 +336,34 @@ also accepts real data and a reference tensor for comparison:
   models_720p 768 1280 32 input.npy out.npy ref.npy
 ```
 
-## Regenerate the models
+### rANS interop test (`test_rans_xop`)
+
+`test_rans_xop` is a low-level CLI driven by a Python harness (e.g.
+`/tmp/xop_test.py`) that round-trips a symbol stream through both the C rANS
+codec here and the official DCVC-UF `py_rans` coder. It proves the zigzag
+remap is correct in both directions:
+
+- UF `py_rans` encode -> C rANS decode: symbols **MATCH**
+- C rANS encode -> UF `py_rans` decode: symbols **MATCH**
+- the two encoded byte streams are **byte-for-byte identical**
 
 ```bash
 cd onnx
-uv run python python/export_all_models.py
+cmake --build out/build/linux-x64 -j2 --target test_rans_xop
+.venv/bin/python /tmp/xop_test.py   # drives out/build/linux-x64/test_rans_xop
+```
+
+(`test_rans_xop` itself takes `encode|decode <cdf.npy> <len.npy> ...`; the
+Python harness builds the zigzag CDF and the symbol list.)
+
+## Regenerate the models
+
+Run with the **dedicated `onnx/.venv`** (see Prerequisites), never the main
+repo venv — the export relies on torch 2.13 `dynamic_shapes`.
+
+```bash
+cd onnx
+.venv/bin/python python/export_all_models.py
 # Custom locations (defaults are relative to the repo root, never hardcoded):
 #   --out-dir <dir>          default: <repo>/onnx/models
 #   --checkpoint <pth>       default: <repo>/checkpoints/cvpr2026_image.pth.tar
@@ -331,7 +371,9 @@ uv run python python/export_all_models.py
 
 This dynamo-exports all 9 intra nets from `DMCI` (including
 `intra_analysis_standard.onnx` from `model.enc`), writes the QP scales, and
-copies the entropy CDF tables into `models/`.
+emits the entropy CDF tables into `models/`. The CDF tables are written in
+DCVC-UF **zigzag** order (`_remap_cdf_assets` remaps them from the RT offset
+layout); the legacy offset arrays are zeroed for API compatibility.
 
 ## Runtime model files (`models/`)
 
