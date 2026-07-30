@@ -10,7 +10,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-add_compile_options(-Wall -Wextra -O3)
+add_compile_options(-Wall -Wextra -O3 -fopenmp -march=armv8-a)
+
 set(CMAKE_BUILD_RPATH "$ORIGIN")
 set(CMAKE_INSTALL_RPATH "$ORIGIN")
 
@@ -43,7 +44,7 @@ add_library(dcvc_rk STATIC
 target_include_directories(dcvc_rk
   PUBLIC  ${RKNN_ROOT}/include
   PRIVATE ${RKNN_ROOT}/src ${RKNN_ROOT}/rans ${RKNN_INCLUDE_DIR})
-target_link_libraries(dcvc_rk PUBLIC dcvc_rk_rans ${RKNNRT_LIB} m pthread)
+target_link_libraries(dcvc_rk PUBLIC dcvc_rk_rans ${RKNNRT_LIB} m pthread gomp)
 set_target_properties(dcvc_rk PROPERTIES
   C_STANDARD 11
   LINKER_LANGUAGE CXX)
@@ -55,3 +56,7 @@ target_include_directories(test_rknn_e2e PRIVATE ${RKNN_ROOT}/include)
 add_executable(test_rknn_smoke ${RKNN_ROOT}/tests/test_rknn_smoke.c)
 target_link_libraries(test_rknn_smoke PRIVATE dcvc_rk m)
 target_include_directories(test_rknn_smoke PRIVATE ${RKNN_ROOT}/include)
+
+add_executable(test_rknn_io_bench ${RKNN_ROOT}/tests/test_rknn_io_bench.c)
+target_link_libraries(test_rknn_io_bench PRIVATE dcvc_rk m)
+target_include_directories(test_rknn_io_bench PRIVATE ${RKNN_ROOT}/include ${RKNN_INCLUDE_DIR})

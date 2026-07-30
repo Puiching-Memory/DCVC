@@ -151,17 +151,25 @@ int main(int argc, char** argv)
 
     double sum_enc = 0, sum_npu = 0;
     int np = 0;
+    float** frames = (float**)calloc((size_t)n_frames, sizeof(float*));
+    if (!frames) return 7;
+    frames[0] = x0;
     for (int f = 1; f < n_frames; f++) {
-        float* xf = synth_rgb(H, W, f);
+        frames[f] = synth_rgb(H, W, f);
+        if (!frames[f]) { /* leak ok on fatal */ return 7; }
+    }
+    for (int f = 1; f < n_frames; f++) {
+        float* xf = frames[f];
+        const float* next_x = (f + 1 < n_frames) ? frames[f + 1] : NULL;
         int reset = (f == 1);
         dcvc_rk_inter_reset_npu_us(inter);
         t0 = now_ms();
-        st = dcvc_rk_inter_encode(inter, xf, reset, reset ? ref : NULL,
-                                  &stream, &stream_sz, xhat);
+        st = dcvc_rk_inter_encode_ex(inter, xf, reset, reset ? ref : NULL,
+                                     &stream, &stream_sz, xhat, next_x);
         double ems = now_ms() - t0;
         if (st != DCVC_RK_OK) {
             fprintf(stderr, "P%d encode failed: %s\n", f, dcvc_rk_status_string(st));
-            free(xf); break;
+            break;
         }
         double psnr = rgb_psnr(xf, xhat, 3 * H * W);
         double pbpp = (stream_sz * 8.0) / ((double)H * W);
@@ -180,8 +188,9 @@ int main(int argc, char** argv)
 
         memcpy(ref, xhat, 3 * (size_t)H * W * sizeof(float));
         free(stream); stream = NULL;
-        free(xf);
     }
+    for (int f = 1; f < n_frames; f++) free(frames[f]);
+    free(frames);
 
     if (np > 0) {
         printf("P avg encode: wall=%.1f ms (%.2f fps)  npu=%.1f ms  non_npu=%.1f ms\n",

@@ -17,11 +17,16 @@ DcvcRkInterLdPipeline* dcvc_rk_inter_create(const char* model_dir, int H, int W,
 void dcvc_rk_inter_destroy(DcvcRkInterLdPipeline* p);
 
 /* reset!=0: first P after I; x_ref is intra recon RGB [3,H,W].
- * Else uses stored previous decoder feature. */
+ * Else uses stored previous decoder feature.
+ * next_x: optional next-frame RGB; prefetched during dec_recon (overlap). */
 DcvcRkStatus dcvc_rk_inter_encode(DcvcRkInterLdPipeline* p, const float* x,
                                   int reset, const float* x_ref,
                                   uint8_t** out_stream, size_t* out_size,
                                   float* x_hat_out);
+DcvcRkStatus dcvc_rk_inter_encode_ex(DcvcRkInterLdPipeline* p, const float* x,
+                                     int reset, const float* x_ref,
+                                     uint8_t** out_stream, size_t* out_size,
+                                     float* x_hat_out, const float* next_x);
 DcvcRkStatus dcvc_rk_inter_decode(DcvcRkInterLdPipeline* p,
                                   const uint8_t* stream, size_t stream_size,
                                   int reset, const float* x_ref,

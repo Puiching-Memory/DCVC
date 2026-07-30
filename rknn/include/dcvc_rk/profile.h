@@ -68,7 +68,7 @@ static inline void dcvc_rk_profile_print(const DcvcRkProfile* p, const char* tit
     if (tcpu < 0) tcpu = 0;
     printf("%-22s %7.1f %7.1f %7.1f %7.1f %7.1f\n",
            "SUM", tw, tn, ts, tg, tcpu);
-    printf("  (* cpu = wall - npu - set - get; set/get = FP32 host<->NPU copy)\n");
+    printf("  (* cpu = wall - npu - set - get; SUM may exceed frame wall if async overlap)\n");
 }
 
 #ifdef __cplusplus
