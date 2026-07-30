@@ -13,7 +13,7 @@ line, multi-input = N .npy paths space-separated (in input order). .npz is
 NOT supported ("Unsupport file").
 
 Usage:
-  python DCVC-family/DCVC-RK/build_rknn_i8.py                # all 15 subnets
+  python DCVC-family/DCVC-RK/build_rknn_i8.py                # all fused subnets
   python DCVC-family/DCVC-RK/build_rknn_i8.py --verify       # + int8-sim vs fp32 cos
   python DCVC-family/DCVC-RK/build_rknn_i8.py --subnets intra_synthesis
 """

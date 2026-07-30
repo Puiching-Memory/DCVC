@@ -7,8 +7,8 @@ Env (read at rknn import time, set BEFORE launching this process):
   RKNN_TILE_CHANNEL_SPLIT_VIEW  -> emit split-view layout
   RKNN_TARGET                   -> rk3588 (default)
 Usage:
-  RKNN_TILE_ANALYSIS=1 python -u rknn_tile_probe.py inter_encoder inter_decoder
-  RKNN_FORCE_TILE_NUM=2 RKNN_TILE_ANALYSIS=1 python -u rknn_tile_probe.py inter_encoder
+  RKNN_TILE_ANALYSIS=1 python -u rknn_tile_probe.py inter_enc_hyper inter_dec_recon
+  RKNN_FORCE_TILE_NUM=2 RKNN_TILE_ANALYSIS=1 python -u rknn_tile_probe.py inter_enc_hyper
 """
 import os, sys, json, tempfile, re
 
@@ -76,7 +76,7 @@ def report(name, rc, logf):
     return len(fb), len(uniq)
 
 def main():
-    names = sys.argv[1:] or ["inter_encoder", "inter_decoder"]
+    names = sys.argv[1:] or ["inter_enc_hyper", "inter_dec_recon"]
     tot_fb = 0
     for n in names:
         if n not in SHAPES:

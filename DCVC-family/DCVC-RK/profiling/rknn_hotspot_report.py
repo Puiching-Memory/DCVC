@@ -4,7 +4,7 @@ def gm(x): return f"{x/1e9:7.2f}G"
 
 subs = sorted(H.items(), key=lambda kv:-kv[1]["total_macs"])
 grand = sum(s["total_macs"] for _,s in subs)
-intra = sum(s["total_macs"] for n,s in subs if n.startswith("intra") or n=="hyper_dec")
+intra = sum(s["total_macs"] for n,s in subs if n.startswith("intra") or n.startswith("y_spatial"))
 inter = grand - intra
 
 print("="*80)

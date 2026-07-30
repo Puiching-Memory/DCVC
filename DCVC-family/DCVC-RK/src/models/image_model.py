@@ -183,3 +183,32 @@ class IntraHyperDecoderRK(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+# ---- Fused export wrappers (fewer host↔NPU round-trips) --------------------
+
+class IntraAnalysisHyperRK(nn.Module):
+    """intra_analysis_hyper: image+q -> (y, z). Encode-only dual-output fuse."""
+
+    def __init__(self):
+        super().__init__()
+        self.analysis = IntraEncoderRK()
+        self.hyper_enc = IntraHyperEncoderRK()
+
+    def forward(self, x, quant_step):
+        y = self.analysis(x, quant_step)
+        z = self.hyper_enc(y)
+        return y, z
+
+
+class IntraPriorChainRK(nn.Module):
+    """intra_prior_chain: z_hat -> params_fusion (514ch).
+    Fuses hyper_dec + y_prior_fusion. AR still runs reduction on the 514ch out."""
+
+    def __init__(self):
+        super().__init__()
+        self.hyper_dec = IntraHyperDecoderRK()
+        self.prior_fusion = IntraPriorFusionRK()
+
+    def forward(self, z_hat):
+        return self.prior_fusion(self.hyper_dec(z_hat))

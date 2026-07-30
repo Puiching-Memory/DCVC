@@ -87,11 +87,13 @@ captured via `os.dup2` redirection.
 
 ## Verified results (rk3588, 1080p = 1088×1920)
 
-15 subnets (4 intra + 11 inter), GLU + split-expand + 256/320 widths + split-adaptor:
+Fused pack (8 intra-side + 6 inter-side incl. AR pieces), GLU + split-expand +
+256/320 widths + split-adaptor. Pre-fusion baseline numbers below still apply to
+the constituent layers:
 
 | metric                 | value                                                            |
 | ---------------------- | ---------------------------------------------------------------- |
-| build success          | **15/15**                                                        |
+| build success          | **15/15** (pre-fusion constituent count)                         |
 | `ConvTranspose` ops    | **0**                                                            |
 | CPU fallback ops       | **0** (only `InputOperator`/`OutputOperator`, which are pure IO) |
 | 3-core fallbacks       | **3** (down from 41 baseline; see below)                         |
@@ -126,18 +128,23 @@ structurally (split-expand + width) instead.
 ## Subnets and resolution map
 
 1080p with H padded to a multiple of 64: image `1088×1920`; f = /8 = `136×240`;
-y = /16 = `68×120`; z = /64 = `17×30`. Each subnet runs at exactly one of these
-resolutions (the ONNX symbols `h`/`h_latent` mean different absolute resolutions per
-model — see `shapes.json` for the authoritative per-input shapes).
+y = /16 = `68×120`; z = /64 = `17×30`. See `shapes.json` for per-input shapes.
 
-- **Intra (I-frame):** `intra_synthesis`, `intra_analysis_standard`, `intra_hyper_enc`, `hyper_dec`
-- **Inter (P-frame):** `inter_feature_adaptor_i/p`, `inter_feature_extractor`, `inter_encoder`, `inter_hyper_enc`, `inter_hyper_dec`, `inter_temporal_prior`, `inter_prior_fusion`, `inter_spatial_prior`, `inter_decoder`, `recon_generation`
+Fused across consecutive NN stages with no entropy/AR barrier (21 → **14** engines):
 
-The structure of every subnet mirrors the DCVC-UF checkpoint
-(`checkpoints/cvpr2025_video.pth.tar` / `cvpr2025_image.pth.tar`); only the
-RKNN-hostile ops change. Note the shipped `src/models/*` Python is **stale** vs the
-checkpoint (e.g. wrong `dcb2` flags, `pixel_unshuffle` downsampling) — the checkpoint
-weight shapes are the authoritative blueprint.
+| Fused name | Composes | I/O |
+|---|---|---|
+| `intra_analysis_hyper` | analysis + hyper_enc | 2in → (y, z) |
+| `intra_prior_chain` | hyper_dec + prior_fusion | z_hat → params_fusion |
+| `intra_synthesis` | (unchanged) | |
+| `y_spatial_prior_*` | AR 4-pass (CPU between) | keep split |
+| `inter_feat_i` / `inter_feat_p` | adaptor + extractor | 1in → (memory, ctx) |
+| `inter_enc_hyper` | encoder + hyper_enc | 3in → (y, z) |
+| `inter_prior_chain` | hyper_dec + temporal + mul/cat + prior_fusion | 3in → params |
+| `inter_spatial_prior` | AR 2-pass (CPU between) | keep split |
+| `inter_dec_recon` | decoder + recon | 4in → (feature, recon) |
+
+Not fused: anything across `z_entropy` or AR mask/rANS passes.
 
 ## Layout
 
@@ -169,8 +176,7 @@ DCVC-family/DCVC-RK/         (mirrors the family src/ layout; no __init__.py)
   The RK model is API-compatible with the DCVC-UF training loop
   (`train_image.py` / `train_video.py`).
 - **On-board `eval_perf()`** to turn the op-count/MACC wins into measured ms per
-  subnet and locate the true wall-time bottleneck (expected: `recon_generation`,
-  `inter_decoder`, `inter_encoder` — the large conv stacks).
-- **Optional**: sub-graph fusion of the parameter-prediction chain
-  (`hyper_decoder + temporal_prior + prior_fusion + spatial_prior`) into one NPU
-  call, if profiling shows host↔device transfer dominates the small subnets.
+  fused subnet and locate the true wall-time bottleneck (expected: `inter_dec_recon`,
+  `inter_enc_hyper`, `intra_synthesis`).
+- **Optional**: fuse `adaptor_k + y_spatial_prior` per AR pass (duplicates
+  spatial_prior weights ×3 — only if set/get still dominates).

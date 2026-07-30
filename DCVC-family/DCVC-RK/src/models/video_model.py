@@ -231,3 +231,79 @@ class ReconGenerationRK(nn.Module):
         out = self.conv(x)
         out = out * quant_step
         return self.head(out)
+
+
+# ---- Fused export wrappers (fewer host↔NPU round-trips) --------------------
+
+class InterFeatIRK(nn.Module):
+    """inter_feat_i: adaptor_i + feature_extractor (I-reset path).
+    Returns (memory, ctx): memory feeds temporal_prior; ctx feeds encoder/decoder."""
+
+    def __init__(self):
+        super().__init__()
+        self.adaptor = FeatureAdaptorIRK()
+        self.extractor = FeatureExtractorRK()
+
+    def forward(self, x):
+        mem = self.adaptor(x)
+        return mem, self.extractor(mem)
+
+
+class InterFeatPRK(nn.Module):
+    """inter_feat_p: adaptor_p + feature_extractor (P continuity path).
+    Returns (memory, ctx) same as inter_feat_i."""
+
+    def __init__(self):
+        super().__init__()
+        self.adaptor = FeatureAdaptorPRK()
+        self.extractor = FeatureExtractorRK()
+
+    def forward(self, ref_feature):
+        mem = self.adaptor(ref_feature)
+        return mem, self.extractor(mem)
+
+
+class InterEncHyperRK(nn.Module):
+    """inter_enc_hyper: encoder + hyper_enc -> (y, z). Encode-only."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = EncoderRK()
+        self.hyper_enc = HyperEncoderRK()
+
+    def forward(self, x, ctx, quant_step):
+        y = self.encoder(x, ctx, quant_step)
+        z = self.hyper_enc(y)
+        return y, z
+
+
+class InterPriorChainRK(nn.Module):
+    """inter_prior_chain: (z_hat, memory, q_feat) -> params (384ch).
+    Fuses hyper_dec + temporal_prior + mul(q) + cat + prior_fusion.
+    spatial_prior stays in the AR loop (CPU between passes)."""
+
+    def __init__(self):
+        super().__init__()
+        self.hyper_dec = HyperDecoderRK()
+        self.temporal = TemporalPriorEncoderRK()
+        self.prior_fusion = PriorFusionRK()
+
+    def forward(self, z_hat, memory, q_feat):
+        hier = self.hyper_dec(z_hat)
+        temporal = self.temporal(memory) * q_feat
+        return self.prior_fusion(torch.cat([hier, temporal], dim=1))
+
+
+class InterDecReconRK(nn.Module):
+    """inter_dec_recon: decoder + recon -> (feature, recon_192).
+    feature is also the next-frame ref_feature; both outputs required."""
+
+    def __init__(self):
+        super().__init__()
+        self.decoder = DecoderRK()
+        self.recon = ReconGenerationRK()
+
+    def forward(self, y_hat, ctx, q_dec, q_recon):
+        feature = self.decoder(y_hat, ctx, q_dec)
+        recon = self.recon(feature, q_recon)
+        return feature, recon
