@@ -2,6 +2,7 @@
 #define DCVC_RK_AR_CODEC_H
 
 #include "dcvc_rk/types.h"
+#include "dcvc_rk/profile.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,6 +28,10 @@ DcvcRkStatus dcvc_rk_ar_decode_y(DcvcRkArCodec* c,
                                  int H, int W,
                                  const uint8_t* stream, size_t stream_size,
                                  float* y_hat_out);
+
+/* Last encode/decode profile (NPU includes all AR subnets). */
+const DcvcRkProfile* dcvc_rk_ar_last_profile(const DcvcRkArCodec* c);
+int64_t dcvc_rk_ar_npu_us(const DcvcRkArCodec* c);
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
 #define DCVC_RK_INTER_LD_PIPELINE_H
 
 #include "dcvc_rk/types.h"
+#include "dcvc_rk/profile.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,6 +29,9 @@ DcvcRkStatus dcvc_rk_inter_decode(DcvcRkInterLdPipeline* p,
 
 int64_t dcvc_rk_inter_npu_us(DcvcRkInterLdPipeline* p);
 void dcvc_rk_inter_reset_npu_us(DcvcRkInterLdPipeline* p);
+
+const DcvcRkProfile* dcvc_rk_inter_last_profile(const DcvcRkInterLdPipeline* p);
+const DcvcRkProfile* dcvc_rk_inter_last_ar_profile(const DcvcRkInterLdPipeline* p);
 
 #ifdef __cplusplus
 }

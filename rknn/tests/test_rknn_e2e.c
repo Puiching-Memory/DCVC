@@ -2,16 +2,21 @@
  *
  *   test_rknn_e2e <model_dir> [H] [W] [qp] [n_frames]
  *
- * Frame 0 = I; frames 1..n-1 = P. Prints wall ms, NPU us, PSNR, bpp.
+ * Frame 0 = I; frames 1..n-1 = P.
+ * Prints wall/NPU summary + stage breakdown (wall / npu / set / get / cpu).
+ * Set DCVC_PROFILE=0 to suppress stage tables.
  */
 #include "dcvc_rk/intra_pipeline.h"
 #include "dcvc_rk/inter_ld_pipeline.h"
+#include "dcvc_rk/profile.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+static int g_profile = 1;
 
 static double now_ms(void)
 {
@@ -43,6 +48,17 @@ static double rgb_psnr(const float* a, const float* b, int n)
     return 10.0 * log10(1.0 / mse);
 }
 
+static void dump_prof(const DcvcRkProfile* p, const DcvcRkProfile* ar, const char* title)
+{
+    if (!g_profile || !p) return;
+    dcvc_rk_profile_print(p, title);
+    if (ar && ar->n > 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s / AR detail", title);
+        dcvc_rk_profile_print(ar, buf);
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -56,6 +72,10 @@ int main(int argc, char** argv)
     int qp = argc > 4 ? atoi(argv[4]) : 32;
     int n_frames = argc > 5 ? atoi(argv[5]) : 3;
     if (n_frames < 1) n_frames = 1;
+    {
+        const char* e = getenv("DCVC_PROFILE");
+        if (e && e[0] == '0') g_profile = 0;
+    }
 
     printf("DCVC-RK e2e  model=%s  %dx%d  qp=%d  frames=%d\n",
            model_dir, H, W, qp, n_frames);
@@ -85,8 +105,11 @@ int main(int argc, char** argv)
     }
     double psnr_e = rgb_psnr(x0, xhat, 3 * H * W);
     double bpp = (stream_sz * 8.0) / ((double)H * W);
-    printf("I encode: wall=%.1f ms  npu=%.1f ms  bytes=%zu  bpp=%.4f  recon_psnr=%.2f dB\n",
-           enc_ms, dcvc_rk_intra_npu_us(intra) / 1000.0, stream_sz, bpp, psnr_e);
+    double npu_e = dcvc_rk_intra_npu_us(intra) / 1000.0;
+    printf("I encode: wall=%.1f ms  npu=%.1f ms  non_npu=%.1f ms  bytes=%zu  bpp=%.4f  recon_psnr=%.2f dB\n",
+           enc_ms, npu_e, enc_ms - npu_e, stream_sz, bpp, psnr_e);
+    dump_prof(dcvc_rk_intra_last_profile(intra),
+              dcvc_rk_intra_last_ar_profile(intra), "I encode");
 
     memset(xhat, 0, 3 * (size_t)H * W * sizeof(float));
     dcvc_rk_intra_reset_npu_us(intra);
@@ -98,8 +121,11 @@ int main(int argc, char** argv)
         return 5;
     }
     double psnr_d = rgb_psnr(x0, xhat, 3 * H * W);
-    printf("I decode: wall=%.1f ms  npu=%.1f ms  psnr=%.2f dB\n",
-           dec_ms, dcvc_rk_intra_npu_us(intra) / 1000.0, psnr_d);
+    double npu_d = dcvc_rk_intra_npu_us(intra) / 1000.0;
+    printf("I decode: wall=%.1f ms  npu=%.1f ms  non_npu=%.1f ms  psnr=%.2f dB\n",
+           dec_ms, npu_d, dec_ms - npu_d, psnr_d);
+    dump_prof(dcvc_rk_intra_last_profile(intra),
+              dcvc_rk_intra_last_ar_profile(intra), "I decode");
 
     /* Keep I recon as P reference; free I engines before loading P to save RAM. */
     float* ref = (float*)malloc(3 * (size_t)H * W * sizeof(float));
@@ -139,22 +165,28 @@ int main(int argc, char** argv)
         }
         double psnr = rgb_psnr(xf, xhat, 3 * H * W);
         double pbpp = (stream_sz * 8.0) / ((double)H * W);
-        printf("P%d encode: wall=%.1f ms  npu=%.1f ms  bytes=%zu  bpp=%.4f  psnr=%.2f dB\n",
-               f, ems, dcvc_rk_inter_npu_us(inter) / 1000.0, stream_sz, pbpp, psnr);
+        double pnpu = dcvc_rk_inter_npu_us(inter) / 1000.0;
+        printf("P%d encode: wall=%.1f ms  npu=%.1f ms  non_npu=%.1f ms  bytes=%zu  bpp=%.4f  psnr=%.2f dB\n",
+               f, ems, pnpu, ems - pnpu, stream_sz, pbpp, psnr);
+        {
+            char title[32];
+            snprintf(title, sizeof(title), "P%d encode", f);
+            dump_prof(dcvc_rk_inter_last_profile(inter),
+                      dcvc_rk_inter_last_ar_profile(inter), title);
+        }
         sum_enc += ems;
-        sum_npu += dcvc_rk_inter_npu_us(inter) / 1000.0;
+        sum_npu += pnpu;
         np++;
 
-        /* Closed-loop: update ref from recon for next frame's conceptual path;
-         * engine keeps DPB feature internally after first P. */
         memcpy(ref, xhat, 3 * (size_t)H * W * sizeof(float));
         free(stream); stream = NULL;
         free(xf);
     }
 
     if (np > 0) {
-        printf("P avg encode: wall=%.1f ms (%.2f fps)  npu=%.1f ms\n",
-               sum_enc / np, 1000.0 / (sum_enc / np), sum_npu / np);
+        printf("P avg encode: wall=%.1f ms (%.2f fps)  npu=%.1f ms  non_npu=%.1f ms\n",
+               sum_enc / np, 1000.0 / (sum_enc / np), sum_npu / np,
+               (sum_enc - sum_npu) / np);
     }
 
     dcvc_rk_inter_destroy(inter);

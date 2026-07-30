@@ -1,6 +1,7 @@
 #include "dcvc_rk/inter_ld_pipeline.h"
 #include "dcvc_rk/ar_codec.h"
 #include "dcvc_rk/kernels.h"
+#include "dcvc_rk/profile.h"
 #include "dcvc_rk/rknn_engine.h"
 #include "npy_reader.h"
 #include "rans_c.h"
@@ -30,35 +31,48 @@ struct DcvcRkInterLdPipeline {
     float *recon_192, *frame_pad, *frame_ycbcr, *frame_rgb;
     int8_t* z_int8;
     int64_t npu_us;
+    DcvcRkProfile prof;
 };
 
+static void acc_eng(DcvcRkStageProf* s, DcvcRkEngine* e, int64_t* npu_acc)
+{
+    if (!s || !e) return;
+    int64_t u = dcvc_rk_engine_last_run_us(e);
+    int64_t su = dcvc_rk_engine_last_set_us(e);
+    int64_t gu = dcvc_rk_engine_last_get_us(e);
+    if (u > 0) { s->npu_ms += u / 1000.0; if (npu_acc) *npu_acc += u; }
+    if (su > 0) s->set_ms += su / 1000.0;
+    if (gu > 0) s->get_ms += gu / 1000.0;
+    s->calls++;
+}
+
 static DcvcRkStatus run1(DcvcRkEngine* e, const float* in, int c, int h, int w,
-                         float* out, int oc, int oh, int ow, int64_t* acc)
+                         float* out, int oc, int oh, int ow,
+                         DcvcRkStageProf* s, int64_t* acc)
 {
     DcvcRkTensorView vin = { (void*)in, 1, c, h, w };
     DcvcRkTensorView vout = { out, 1, oc, oh, ow };
+    double t0 = dcvc_rk_now_ms();
     DcvcRkStatus st = dcvc_rk_engine_run(e, &vin, 1, &vout, 1);
-    if (acc && st == DCVC_RK_OK) {
-        int64_t u = dcvc_rk_engine_last_run_us(e);
-        if (u > 0) *acc += u;
-    }
+    if (s) s->wall_ms += dcvc_rk_now_ms() - t0;
+    if (st == DCVC_RK_OK) acc_eng(s, e, acc);
     return st;
 }
 
 static DcvcRkStatus run2(DcvcRkEngine* e,
                          const float* a, int ca, int ha, int wa,
                          const float* b, int cb, int hb, int wb,
-                         float* out, int oc, int oh, int ow, int64_t* acc)
+                         float* out, int oc, int oh, int ow,
+                         DcvcRkStageProf* s, int64_t* acc)
 {
     DcvcRkTensorView vin[2] = {
         { (void*)a, 1, ca, ha, wa }, { (void*)b, 1, cb, hb, wb }
     };
     DcvcRkTensorView vout = { out, 1, oc, oh, ow };
+    double t0 = dcvc_rk_now_ms();
     DcvcRkStatus st = dcvc_rk_engine_run(e, vin, 2, &vout, 1);
-    if (acc && st == DCVC_RK_OK) {
-        int64_t u = dcvc_rk_engine_last_run_us(e);
-        if (u > 0) *acc += u;
-    }
+    if (s) s->wall_ms += dcvc_rk_now_ms() - t0;
+    if (st == DCVC_RK_OK) acc_eng(s, e, acc);
     return st;
 }
 
@@ -66,7 +80,8 @@ static DcvcRkStatus run3(DcvcRkEngine* e,
                          const float* a, int ca, int ha, int wa,
                          const float* b, int cb, int hb, int wb,
                          const float* c, int cc, int hc, int wc,
-                         float* out, int oc, int oh, int ow, int64_t* acc)
+                         float* out, int oc, int oh, int ow,
+                         DcvcRkStageProf* s, int64_t* acc)
 {
     DcvcRkTensorView vin[3] = {
         { (void*)a, 1, ca, ha, wa },
@@ -74,11 +89,10 @@ static DcvcRkStatus run3(DcvcRkEngine* e,
         { (void*)c, 1, cc, hc, wc }
     };
     DcvcRkTensorView vout = { out, 1, oc, oh, ow };
+    double t0 = dcvc_rk_now_ms();
     DcvcRkStatus st = dcvc_rk_engine_run(e, vin, 3, &vout, 1);
-    if (acc && st == DCVC_RK_OK) {
-        int64_t u = dcvc_rk_engine_last_run_us(e);
-        if (u > 0) *acc += u;
-    }
+    if (s) s->wall_ms += dcvc_rk_now_ms() - t0;
+    if (st == DCVC_RK_OK) acc_eng(s, e, acc);
     return st;
 }
 
@@ -97,22 +111,27 @@ static int load_qrow(const char* path, int qp, int expect_c, float** out)
     return 0;
 }
 
-static DcvcRkStatus build_memory(DcvcRkInterLdPipeline* p, int reset, const float* x_ref)
+static DcvcRkStatus build_memory(DcvcRkInterLdPipeline* p, int reset, const float* x_ref,
+                                 DcvcRkStageProf* s_pre, DcvcRkStageProf* s_fa,
+                                 DcvcRkStageProf* s_fe)
 {
     DcvcRkStatus st;
     if (reset) {
         if (!x_ref) return DCVC_RK_ERR_INVALID_ARG;
+        double t = dcvc_rk_now_ms();
         dcvc_rk_replicate_pad_3(x_ref, p->H, p->W, p->frame_pad, p->Hp, p->Wp);
         dcvc_rk_rgb_to_ycbcr(p->frame_pad, p->frame_ycbcr, p->Hp * p->Wp);
         dcvc_rk_pixel_unshuffle_8(p->frame_ycbcr, p->ref_unshuf, p->Hp, p->Wp);
+        if (s_pre) s_pre->wall_ms += dcvc_rk_now_ms() - t;
         st = run1(p->eng_fai, p->ref_unshuf, SRCD, p->fH, p->fW,
-                  p->memory, DCH, p->fH, p->fW, &p->npu_us);
+                  p->memory, DCH, p->fH, p->fW, s_fa, &p->npu_us);
     } else {
         st = run1(p->eng_fap, p->ref_feature, DCH, p->fH, p->fW,
-                  p->memory, DCH, p->fH, p->fW, &p->npu_us);
+                  p->memory, DCH, p->fH, p->fW, s_fa, &p->npu_us);
     }
     if (st != DCVC_RK_OK) return st;
-    return run1(p->eng_fe, p->memory, DCH, p->fH, p->fW, p->ctx, DCH, p->fH, p->fW, &p->npu_us);
+    return run1(p->eng_fe, p->memory, DCH, p->fH, p->fW, p->ctx, DCH, p->fH, p->fW,
+                s_fe, &p->npu_us);
 }
 
 DcvcRkInterLdPipeline* dcvc_rk_inter_create(const char* model_dir, int H, int W, int qp,
@@ -213,6 +232,29 @@ void dcvc_rk_inter_destroy(DcvcRkInterLdPipeline* p)
 
 int64_t dcvc_rk_inter_npu_us(DcvcRkInterLdPipeline* p) { return p ? p->npu_us : 0; }
 void dcvc_rk_inter_reset_npu_us(DcvcRkInterLdPipeline* p) { if (p) p->npu_us = 0; }
+const DcvcRkProfile* dcvc_rk_inter_last_profile(const DcvcRkInterLdPipeline* p)
+{
+    return p ? &p->prof : NULL;
+}
+const DcvcRkProfile* dcvc_rk_inter_last_ar_profile(const DcvcRkInterLdPipeline* p)
+{
+    return (p && p->ar) ? dcvc_rk_ar_last_profile(p->ar) : NULL;
+}
+
+static void fold_ar(DcvcRkStageProf* s_ar, DcvcRkArCodec* ar, int64_t* npu_acc)
+{
+    if (!s_ar || !ar) return;
+    const DcvcRkProfile* ap = dcvc_rk_ar_last_profile(ar);
+    if (ap) {
+        for (int i = 0; i < ap->n; i++) {
+            s_ar->npu_ms += ap->stages[i].npu_ms;
+            s_ar->set_ms += ap->stages[i].set_ms;
+            s_ar->get_ms += ap->stages[i].get_ms;
+            s_ar->calls  += ap->stages[i].calls;
+        }
+    }
+    if (npu_acc) *npu_acc += dcvc_rk_ar_npu_us(ar);
+}
 
 static DcvcRkStatus encode_core(DcvcRkInterLdPipeline* p, const float* x,
                                 int reset, const float* x_ref,
@@ -220,21 +262,40 @@ static DcvcRkStatus encode_core(DcvcRkInterLdPipeline* p, const float* x,
                                 float* x_hat_out)
 {
     int Hp = p->Hp, Wp = p->Wp, yHW = p->yH * p->yW, zHW = p->zH * p->zW;
-    DcvcRkStatus st = build_memory(p, reset, x_ref);
+    dcvc_rk_profile_reset(&p->prof);
+    DcvcRkStageProf* s_pre = dcvc_rk_profile_add(&p->prof, "preprocess");
+    DcvcRkStageProf* s_fa  = dcvc_rk_profile_add(&p->prof, "feat_adaptor");
+    DcvcRkStageProf* s_fe  = dcvc_rk_profile_add(&p->prof, "feat_extract");
+    DcvcRkStageProf* s_enc = dcvc_rk_profile_add(&p->prof, "inter_encoder");
+    DcvcRkStageProf* s_he  = dcvc_rk_profile_add(&p->prof, "hyper_enc");
+    DcvcRkStageProf* s_ze  = dcvc_rk_profile_add(&p->prof, "z_entropy");
+    DcvcRkStageProf* s_hd  = dcvc_rk_profile_add(&p->prof, "hyper_dec");
+    DcvcRkStageProf* s_tp  = dcvc_rk_profile_add(&p->prof, "temporal_prior");
+    DcvcRkStageProf* s_pf  = dcvc_rk_profile_add(&p->prof, "prior_fusion");
+    DcvcRkStageProf* s_ar  = dcvc_rk_profile_add(&p->prof, "ar_y");
+    DcvcRkStageProf* s_dec = dcvc_rk_profile_add(&p->prof, "inter_decoder");
+    DcvcRkStageProf* s_rec = dcvc_rk_profile_add(&p->prof, "recon_gen");
+    DcvcRkStageProf* s_post = dcvc_rk_profile_add(&p->prof, "postprocess");
+
+    DcvcRkStatus st = build_memory(p, reset, x_ref, s_pre, s_fa, s_fe);
     if (st != DCVC_RK_OK) return st;
 
+    double t = dcvc_rk_now_ms();
     dcvc_rk_replicate_pad_3(x, p->H, p->W, p->frame_pad, Hp, Wp);
     dcvc_rk_rgb_to_ycbcr(p->frame_pad, p->frame_ycbcr, Hp * Wp);
     dcvc_rk_pixel_unshuffle_8(p->frame_ycbcr, p->x_unshuf, Hp, Wp);
+    if (s_pre) s_pre->wall_ms += dcvc_rk_now_ms() - t;
 
     st = run3(p->eng_enc, p->x_unshuf, SRCD, p->fH, p->fW,
               p->ctx, DCH, p->fH, p->fW, p->q_enc, DCH, 1, 1,
-              p->y, YCH, p->yH, p->yW, &p->npu_us);
+              p->y, YCH, p->yH, p->yW, s_enc, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
-    st = run1(p->eng_henc, p->y, YCH, p->yH, p->yW, p->z, ZCH, p->zH, p->zW, &p->npu_us);
+    st = run1(p->eng_henc, p->y, YCH, p->yH, p->yW, p->z, ZCH, p->zH, p->zW,
+              s_he, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
-    dcvc_rk_round_to_int8(p->z, p->z_hat, p->z_int8, ZCH * zHW);
 
+    t = dcvc_rk_now_ms();
+    dcvc_rk_round_to_int8(p->z, p->z_hat, p->z_int8, ZCH * zHW);
     dcvc_rans_encoder_reset(p->rans_enc);
     int zidx = dcvc_rans_encoder_add_cdf(p->rans_enc, dcvc_npy_i32(&p->zcdf),
                     p->zcdf.dims[0], p->zcdf.dims[1],
@@ -244,28 +305,38 @@ static DcvcRkStatus encode_core(DcvcRkInterLdPipeline* p, const float* x,
     uint8_t* z_stream = NULL; size_t z_sz = 0;
     if (dcvc_rans_encoder_get_stream(p->rans_enc, &z_stream, &z_sz) != 0)
         return DCVC_RK_ERR_ENTROPY;
+    if (s_ze) s_ze->wall_ms = dcvc_rk_now_ms() - t;
 
-    st = run1(p->eng_hdec, p->z_hat, ZCH, p->zH, p->zW, p->hier, YCH, p->yH, p->yW, &p->npu_us);
+    st = run1(p->eng_hdec, p->z_hat, ZCH, p->zH, p->zW, p->hier, YCH, p->yH, p->yW,
+              s_hd, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
-    st = run1(p->eng_temp, p->memory, DCH, p->fH, p->fW, p->temporal, DCH, p->yH, p->yW, &p->npu_us);
+    st = run1(p->eng_temp, p->memory, DCH, p->fH, p->fW, p->temporal, DCH, p->yH, p->yW,
+              s_tp, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
-    /* cat(hier[128], temporal[256]*q_feature) -> prior_fusion */
+
+    t = dcvc_rk_now_ms();
     dcvc_rk_mul_q_broadcast(p->temporal, p->q_feat, p->temporal, DCH, yHW);
     memcpy(p->pf_in, p->hier, (size_t)YCH * yHW * sizeof(float));
     memcpy(p->pf_in + YCH * yHW, p->temporal, (size_t)DCH * yHW * sizeof(float));
-    st = run1(p->eng_pfus, p->pf_in, PFCH, p->yH, p->yW, p->params, PFCH, p->yH, p->yW, &p->npu_us);
+    double t_cpu = dcvc_rk_now_ms() - t;
+    st = run1(p->eng_pfus, p->pf_in, PFCH, p->yH, p->yW, p->params, PFCH, p->yH, p->yW,
+              s_pf, &p->npu_us);
+    if (s_pf) s_pf->wall_ms += t_cpu; /* include cat/mul in prior_fusion wall */
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
 
+    t = dcvc_rk_now_ms();
     uint8_t* y_stream = NULL; size_t y_sz = 0;
     st = dcvc_rk_ar_encode_y(p->ar, p->y, p->params, p->yH, p->yW, &y_stream, &y_sz, p->y_hat);
+    if (s_ar) s_ar->wall_ms = dcvc_rk_now_ms() - t;
+    fold_ar(s_ar, p->ar, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
 
     st = run3(p->eng_dec, p->y_hat, YCH, p->yH, p->yW,
               p->ctx, DCH, p->fH, p->fW, p->q_dec, DCH, 1, 1,
-              p->feature_dec, DCH, p->fH, p->fW, &p->npu_us);
+              p->feature_dec, DCH, p->fH, p->fW, s_dec, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); free(y_stream); return st; }
     st = run2(p->eng_recon, p->feature_dec, DCH, p->fH, p->fW, p->q_recon, RECON_Q, 1, 1,
-              p->recon_192, SRCD, p->fH, p->fW, &p->npu_us);
+              p->recon_192, SRCD, p->fH, p->fW, s_rec, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); free(y_stream); return st; }
 
     memcpy(p->ref_feature, p->feature_dec, (size_t)DCH * p->fH * p->fW * sizeof(float));
@@ -281,9 +352,11 @@ static DcvcRkStatus encode_core(DcvcRkInterLdPipeline* p, const float* x,
     *out_stream = buf; *out_size = total;
 
     if (x_hat_out) {
+        t = dcvc_rk_now_ms();
         dcvc_rk_pixel_shuffle_8(p->recon_192, p->frame_ycbcr, Hp, Wp);
         dcvc_rk_ycbcr_to_rgb(p->frame_ycbcr, p->frame_rgb, Hp * Wp);
         dcvc_rk_crop_3(p->frame_rgb, Hp, Wp, x_hat_out, p->H, p->W);
+        if (s_post) s_post->wall_ms = dcvc_rk_now_ms() - t;
     }
     return DCVC_RK_OK;
 }
@@ -312,9 +385,23 @@ DcvcRkStatus dcvc_rk_inter_decode(DcvcRkInterLdPipeline* p,
     const uint8_t* y_stream = stream + 4 + z_sz;
     size_t y_sz = stream_size - 4 - z_sz;
 
-    DcvcRkStatus st = build_memory(p, reset, x_ref);
+    dcvc_rk_profile_reset(&p->prof);
+    DcvcRkStageProf* s_pre = dcvc_rk_profile_add(&p->prof, "preprocess");
+    DcvcRkStageProf* s_fa  = dcvc_rk_profile_add(&p->prof, "feat_adaptor");
+    DcvcRkStageProf* s_fe  = dcvc_rk_profile_add(&p->prof, "feat_extract");
+    DcvcRkStageProf* s_ze  = dcvc_rk_profile_add(&p->prof, "z_entropy");
+    DcvcRkStageProf* s_hd  = dcvc_rk_profile_add(&p->prof, "hyper_dec");
+    DcvcRkStageProf* s_tp  = dcvc_rk_profile_add(&p->prof, "temporal_prior");
+    DcvcRkStageProf* s_pf  = dcvc_rk_profile_add(&p->prof, "prior_fusion");
+    DcvcRkStageProf* s_ar  = dcvc_rk_profile_add(&p->prof, "ar_y");
+    DcvcRkStageProf* s_dec = dcvc_rk_profile_add(&p->prof, "inter_decoder");
+    DcvcRkStageProf* s_rec = dcvc_rk_profile_add(&p->prof, "recon_gen");
+    DcvcRkStageProf* s_post = dcvc_rk_profile_add(&p->prof, "postprocess");
+
+    DcvcRkStatus st = build_memory(p, reset, x_ref, s_pre, s_fa, s_fe);
     if (st != DCVC_RK_OK) return st;
 
+    double t = dcvc_rk_now_ms();
     dcvc_rans_decoder_reset_cdf(p->rans_dec);
     int zidx = dcvc_rans_decoder_add_cdf(p->rans_dec, dcvc_npy_i32(&p->zcdf),
                     p->zcdf.dims[0], p->zcdf.dims[1],
@@ -326,31 +413,44 @@ DcvcRkStatus dcvc_rk_inter_decode(DcvcRkInterLdPipeline* p,
     if (dcvc_rans_decoder_has_error(p->rans_dec)) { free(zsyms); return DCVC_RK_ERR_ENTROPY; }
     dcvc_rk_int8_to_float(zsyms, p->z_hat, ZCH * zHW);
     free(zsyms);
+    if (s_ze) s_ze->wall_ms = dcvc_rk_now_ms() - t;
 
-    st = run1(p->eng_hdec, p->z_hat, ZCH, p->zH, p->zW, p->hier, YCH, p->yH, p->yW, &p->npu_us);
+    st = run1(p->eng_hdec, p->z_hat, ZCH, p->zH, p->zW, p->hier, YCH, p->yH, p->yW,
+              s_hd, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
-    st = run1(p->eng_temp, p->memory, DCH, p->fH, p->fW, p->temporal, DCH, p->yH, p->yW, &p->npu_us);
+    st = run1(p->eng_temp, p->memory, DCH, p->fH, p->fW, p->temporal, DCH, p->yH, p->yW,
+              s_tp, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
+
+    t = dcvc_rk_now_ms();
     dcvc_rk_mul_q_broadcast(p->temporal, p->q_feat, p->temporal, DCH, yHW);
     memcpy(p->pf_in, p->hier, (size_t)YCH * yHW * sizeof(float));
     memcpy(p->pf_in + YCH * yHW, p->temporal, (size_t)DCH * yHW * sizeof(float));
-    st = run1(p->eng_pfus, p->pf_in, PFCH, p->yH, p->yW, p->params, PFCH, p->yH, p->yW, &p->npu_us);
+    double t_cpu = dcvc_rk_now_ms() - t;
+    st = run1(p->eng_pfus, p->pf_in, PFCH, p->yH, p->yW, p->params, PFCH, p->yH, p->yW,
+              s_pf, &p->npu_us);
+    if (s_pf) s_pf->wall_ms += t_cpu;
     if (st != DCVC_RK_OK) return st;
 
+    t = dcvc_rk_now_ms();
     st = dcvc_rk_ar_decode_y(p->ar, p->params, p->yH, p->yW, y_stream, y_sz, p->y_hat);
+    if (s_ar) s_ar->wall_ms = dcvc_rk_now_ms() - t;
+    fold_ar(s_ar, p->ar, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
 
     st = run3(p->eng_dec, p->y_hat, YCH, p->yH, p->yW,
               p->ctx, DCH, p->fH, p->fW, p->q_dec, DCH, 1, 1,
-              p->feature_dec, DCH, p->fH, p->fW, &p->npu_us);
+              p->feature_dec, DCH, p->fH, p->fW, s_dec, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
     st = run2(p->eng_recon, p->feature_dec, DCH, p->fH, p->fW, p->q_recon, RECON_Q, 1, 1,
-              p->recon_192, SRCD, p->fH, p->fW, &p->npu_us);
+              p->recon_192, SRCD, p->fH, p->fW, s_rec, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
 
     memcpy(p->ref_feature, p->feature_dec, (size_t)DCH * p->fH * p->fW * sizeof(float));
+    t = dcvc_rk_now_ms();
     dcvc_rk_pixel_shuffle_8(p->recon_192, p->frame_ycbcr, Hp, Wp);
     dcvc_rk_ycbcr_to_rgb(p->frame_ycbcr, p->frame_rgb, Hp * Wp);
     dcvc_rk_crop_3(p->frame_rgb, Hp, Wp, x_hat_out, p->H, p->W);
+    if (s_post) s_post->wall_ms = dcvc_rk_now_ms() - t;
     return DCVC_RK_OK;
 }

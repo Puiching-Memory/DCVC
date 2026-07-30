@@ -1,6 +1,7 @@
 #include "dcvc_rk/intra_pipeline.h"
 #include "dcvc_rk/ar_codec.h"
 #include "dcvc_rk/kernels.h"
+#include "dcvc_rk/profile.h"
 #include "dcvc_rk/rknn_engine.h"
 #include "npy_reader.h"
 #include "rans_c.h"
@@ -27,36 +28,49 @@ struct DcvcRkIntraPipeline {
     float *x_pad, *x_ycbcr, *x_hat;
     int8_t* z_int8;
     int64_t npu_us;
+    DcvcRkProfile prof;
 };
 
+static void acc_eng(DcvcRkStageProf* s, DcvcRkEngine* e, int64_t* npu_acc)
+{
+    if (!s || !e) return;
+    int64_t u = dcvc_rk_engine_last_run_us(e);
+    int64_t su = dcvc_rk_engine_last_set_us(e);
+    int64_t gu = dcvc_rk_engine_last_get_us(e);
+    if (u > 0) { s->npu_ms += u / 1000.0; if (npu_acc) *npu_acc += u; }
+    if (su > 0) s->set_ms += su / 1000.0;
+    if (gu > 0) s->get_ms += gu / 1000.0;
+    s->calls++;
+}
+
 static DcvcRkStatus run1(DcvcRkEngine* e, const float* in, int c, int h, int w,
-                         float* out, int oc, int oh, int ow, int64_t* acc)
+                         float* out, int oc, int oh, int ow,
+                         DcvcRkStageProf* s, int64_t* acc)
 {
     DcvcRkTensorView vin = { (void*)in, 1, c, h, w };
     DcvcRkTensorView vout = { out, 1, oc, oh, ow };
+    double t0 = dcvc_rk_now_ms();
     DcvcRkStatus st = dcvc_rk_engine_run(e, &vin, 1, &vout, 1);
-    if (acc && st == DCVC_RK_OK) {
-        int64_t u = dcvc_rk_engine_last_run_us(e);
-        if (u > 0) *acc += u;
-    }
+    if (s) s->wall_ms += dcvc_rk_now_ms() - t0;
+    if (st == DCVC_RK_OK) acc_eng(s, e, acc);
     return st;
 }
 
 static DcvcRkStatus run2(DcvcRkEngine* e,
                          const float* a, int ca, int ha, int wa,
                          const float* b, int cb, int hb, int wb,
-                         float* out, int oc, int oh, int ow, int64_t* acc)
+                         float* out, int oc, int oh, int ow,
+                         DcvcRkStageProf* s, int64_t* acc)
 {
     DcvcRkTensorView vin[2] = {
         { (void*)a, 1, ca, ha, wa },
         { (void*)b, 1, cb, hb, wb }
     };
     DcvcRkTensorView vout = { out, 1, oc, oh, ow };
+    double t0 = dcvc_rk_now_ms();
     DcvcRkStatus st = dcvc_rk_engine_run(e, vin, 2, &vout, 1);
-    if (acc && st == DCVC_RK_OK) {
-        int64_t u = dcvc_rk_engine_last_run_us(e);
-        if (u > 0) *acc += u;
-    }
+    if (s) s->wall_ms += dcvc_rk_now_ms() - t0;
+    if (st == DCVC_RK_OK) acc_eng(s, e, acc);
     return st;
 }
 
@@ -160,6 +174,14 @@ void dcvc_rk_intra_destroy(DcvcRkIntraPipeline* p)
 
 int64_t dcvc_rk_intra_npu_us(DcvcRkIntraPipeline* p) { return p ? p->npu_us : 0; }
 void dcvc_rk_intra_reset_npu_us(DcvcRkIntraPipeline* p) { if (p) p->npu_us = 0; }
+const DcvcRkProfile* dcvc_rk_intra_last_profile(const DcvcRkIntraPipeline* p)
+{
+    return p ? &p->prof : NULL;
+}
+const DcvcRkProfile* dcvc_rk_intra_last_ar_profile(const DcvcRkIntraPipeline* p)
+{
+    return (p && p->ar) ? dcvc_rk_ar_last_profile(p->ar) : NULL;
+}
 
 DcvcRkStatus dcvc_rk_intra_encode(DcvcRkIntraPipeline* p, const float* x,
                                   uint8_t** out_stream, size_t* out_size,
@@ -168,18 +190,34 @@ DcvcRkStatus dcvc_rk_intra_encode(DcvcRkIntraPipeline* p, const float* x,
     if (!p || !x || !out_stream || !out_size) return DCVC_RK_ERR_INVALID_ARG;
     *out_stream = NULL; *out_size = 0;
     int Hp = p->Hp, Wp = p->Wp, yhw = p->yH * p->yW, zhw = p->zH * p->zW;
+    (void)yhw;
     DcvcRkStatus st;
+    dcvc_rk_profile_reset(&p->prof);
+    DcvcRkStageProf* s_pre = dcvc_rk_profile_add(&p->prof, "preprocess");
+    DcvcRkStageProf* s_ana = dcvc_rk_profile_add(&p->prof, "analysis");
+    DcvcRkStageProf* s_he  = dcvc_rk_profile_add(&p->prof, "hyper_enc");
+    DcvcRkStageProf* s_ze  = dcvc_rk_profile_add(&p->prof, "z_entropy");
+    DcvcRkStageProf* s_hd  = dcvc_rk_profile_add(&p->prof, "hyper_dec");
+    DcvcRkStageProf* s_pf  = dcvc_rk_profile_add(&p->prof, "prior_fusion");
+    DcvcRkStageProf* s_ar  = dcvc_rk_profile_add(&p->prof, "ar_y");
+    DcvcRkStageProf* s_syn = dcvc_rk_profile_add(&p->prof, "synthesis");
+    DcvcRkStageProf* s_post = dcvc_rk_profile_add(&p->prof, "postprocess");
 
+    double t = dcvc_rk_now_ms();
     dcvc_rk_replicate_pad_3(x, p->H, p->W, p->x_pad, Hp, Wp);
     dcvc_rk_rgb_to_ycbcr(p->x_pad, p->x_ycbcr, Hp * Wp);
+    if (s_pre) s_pre->wall_ms = dcvc_rk_now_ms() - t;
+
     st = run2(p->eng_analysis, p->x_ycbcr, 3, Hp, Wp, p->qenc, Q_CH, 1, 1,
-              p->y, N_CH, p->yH, p->yW, &p->npu_us);
+              p->y, N_CH, p->yH, p->yW, s_ana, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
 
-    st = run1(p->eng_hyper_enc, p->y, N_CH, p->yH, p->yW, p->z, Z_CH, p->zH, p->zW, &p->npu_us);
+    st = run1(p->eng_hyper_enc, p->y, N_CH, p->yH, p->yW, p->z, Z_CH, p->zH, p->zW,
+              s_he, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
+
+    t = dcvc_rk_now_ms();
     dcvc_rk_round_to_int8(p->z, p->z_hat, p->z_int8, Z_CH * zhw);
-
     dcvc_rans_encoder_reset(p->rans_enc);
     int zidx = dcvc_rans_encoder_add_cdf(p->rans_enc, dcvc_npy_i32(&p->zcdf),
                     p->zcdf.dims[0], p->zcdf.dims[1],
@@ -189,16 +227,33 @@ DcvcRkStatus dcvc_rk_intra_encode(DcvcRkIntraPipeline* p, const float* x,
     uint8_t* z_stream = NULL; size_t z_sz = 0;
     if (dcvc_rans_encoder_get_stream(p->rans_enc, &z_stream, &z_sz) != 0)
         return DCVC_RK_ERR_ENTROPY;
+    if (s_ze) s_ze->wall_ms = dcvc_rk_now_ms() - t;
 
-    st = run1(p->eng_hyper_dec, p->z_hat, Z_CH, p->zH, p->zW, p->params, N_CH, p->yH, p->yW, &p->npu_us);
+    st = run1(p->eng_hyper_dec, p->z_hat, Z_CH, p->zH, p->zW, p->params, N_CH, p->yH, p->yW,
+              s_hd, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
     st = run1(p->eng_prior_fusion, p->params, N_CH, p->yH, p->yW,
-              p->params_fusion, PF_CH, p->yH, p->yW, &p->npu_us);
+              p->params_fusion, PF_CH, p->yH, p->yW, s_pf, &p->npu_us);
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
 
+    t = dcvc_rk_now_ms();
     uint8_t* y_stream = NULL; size_t y_sz = 0;
     st = dcvc_rk_ar_encode_y(p->ar, p->y, p->params_fusion, p->yH, p->yW,
                              &y_stream, &y_sz, p->y_hat);
+    if (s_ar) {
+        s_ar->wall_ms = dcvc_rk_now_ms() - t;
+        /* Fold AR subnet NPU/IO into this stage; detailed AR printed separately. */
+        const DcvcRkProfile* ap = dcvc_rk_ar_last_profile(p->ar);
+        if (ap) {
+            for (int i = 0; i < ap->n; i++) {
+                s_ar->npu_ms += ap->stages[i].npu_ms;
+                s_ar->set_ms += ap->stages[i].set_ms;
+                s_ar->get_ms += ap->stages[i].get_ms;
+                s_ar->calls  += ap->stages[i].calls;
+            }
+        }
+        p->npu_us += dcvc_rk_ar_npu_us(p->ar);
+    }
     if (st != DCVC_RK_OK) { free(z_stream); return st; }
 
     size_t total = 4 + z_sz + y_sz;
@@ -213,10 +268,12 @@ DcvcRkStatus dcvc_rk_intra_encode(DcvcRkIntraPipeline* p, const float* x,
 
     if (x_hat_out) {
         st = run2(p->eng_synthesis, p->y_hat, N_CH, p->yH, p->yW, p->qdec, Q_CH, 1, 1,
-                  p->x_ycbcr, 3, Hp, Wp, &p->npu_us);
+                  p->x_ycbcr, 3, Hp, Wp, s_syn, &p->npu_us);
         if (st != DCVC_RK_OK) return st;
+        t = dcvc_rk_now_ms();
         dcvc_rk_ycbcr_to_rgb(p->x_ycbcr, p->x_hat, Hp * Wp);
         dcvc_rk_crop_3(p->x_hat, Hp, Wp, x_hat_out, p->H, p->W);
+        if (s_post) s_post->wall_ms = dcvc_rk_now_ms() - t;
     }
     return DCVC_RK_OK;
 }
@@ -234,6 +291,15 @@ DcvcRkStatus dcvc_rk_intra_decode(DcvcRkIntraPipeline* p,
     const uint8_t* y_stream = stream + 4 + z_sz;
     size_t y_sz = stream_size - 4 - z_sz;
 
+    dcvc_rk_profile_reset(&p->prof);
+    DcvcRkStageProf* s_ze  = dcvc_rk_profile_add(&p->prof, "z_entropy");
+    DcvcRkStageProf* s_hd  = dcvc_rk_profile_add(&p->prof, "hyper_dec");
+    DcvcRkStageProf* s_pf  = dcvc_rk_profile_add(&p->prof, "prior_fusion");
+    DcvcRkStageProf* s_ar  = dcvc_rk_profile_add(&p->prof, "ar_y");
+    DcvcRkStageProf* s_syn = dcvc_rk_profile_add(&p->prof, "synthesis");
+    DcvcRkStageProf* s_post = dcvc_rk_profile_add(&p->prof, "postprocess");
+
+    double t = dcvc_rk_now_ms();
     dcvc_rans_decoder_reset_cdf(p->rans_dec);
     int zidx = dcvc_rans_decoder_add_cdf(p->rans_dec, dcvc_npy_i32(&p->zcdf),
                     p->zcdf.dims[0], p->zcdf.dims[1],
@@ -245,19 +311,38 @@ DcvcRkStatus dcvc_rk_intra_decode(DcvcRkIntraPipeline* p,
     if (dcvc_rans_decoder_has_error(p->rans_dec)) { free(zsyms); return DCVC_RK_ERR_ENTROPY; }
     dcvc_rk_int8_to_float(zsyms, p->z_hat, Z_CH * zhw);
     free(zsyms);
+    if (s_ze) s_ze->wall_ms = dcvc_rk_now_ms() - t;
 
     DcvcRkStatus st = run1(p->eng_hyper_dec, p->z_hat, Z_CH, p->zH, p->zW,
-                           p->params, N_CH, p->yH, p->yW, &p->npu_us);
+                           p->params, N_CH, p->yH, p->yW, s_hd, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
     st = run1(p->eng_prior_fusion, p->params, N_CH, p->yH, p->yW,
-              p->params_fusion, PF_CH, p->yH, p->yW, &p->npu_us);
+              p->params_fusion, PF_CH, p->yH, p->yW, s_pf, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
+
+    t = dcvc_rk_now_ms();
     st = dcvc_rk_ar_decode_y(p->ar, p->params_fusion, p->yH, p->yW, y_stream, y_sz, p->y_hat);
+    if (s_ar) {
+        s_ar->wall_ms = dcvc_rk_now_ms() - t;
+        const DcvcRkProfile* ap = dcvc_rk_ar_last_profile(p->ar);
+        if (ap) {
+            for (int i = 0; i < ap->n; i++) {
+                s_ar->npu_ms += ap->stages[i].npu_ms;
+                s_ar->set_ms += ap->stages[i].set_ms;
+                s_ar->get_ms += ap->stages[i].get_ms;
+                s_ar->calls  += ap->stages[i].calls;
+            }
+        }
+        p->npu_us += dcvc_rk_ar_npu_us(p->ar);
+    }
     if (st != DCVC_RK_OK) return st;
+
     st = run2(p->eng_synthesis, p->y_hat, N_CH, p->yH, p->yW, p->qdec, Q_CH, 1, 1,
-              p->x_ycbcr, 3, Hp, Wp, &p->npu_us);
+              p->x_ycbcr, 3, Hp, Wp, s_syn, &p->npu_us);
     if (st != DCVC_RK_OK) return st;
+    t = dcvc_rk_now_ms();
     dcvc_rk_ycbcr_to_rgb(p->x_ycbcr, p->x_hat, Hp * Wp);
     dcvc_rk_crop_3(p->x_hat, Hp, Wp, x_hat_out, p->H, p->W);
+    if (s_post) s_post->wall_ms = dcvc_rk_now_ms() - t;
     return DCVC_RK_OK;
 }

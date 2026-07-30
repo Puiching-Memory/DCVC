@@ -30,6 +30,8 @@ Place `.rknn` siblings from `dcvc_rk_1080p_i8.zip` plus runtime tables:
 bash rknn/scripts/run_e2e.sh rknn/models/1080p_i8 1088 1920 32 3
 ```
 
-Frame 0 = I; remaining = UF-LD P. Reports wall ms, NPU `PERF_RUN` ms, bpp, PSNR.
+Frame 0 = I; remaining = UF-LD P. Reports wall ms, NPU `PERF_RUN` ms, bpp, PSNR,
+plus a stage table (`wall / npu / set / get / cpu`). `set`/`get` are FP32
+`rknn_inputs_set` / `rknn_outputs_get`. Set `DCVC_PROFILE=0` to suppress tables.
 
 Placeholder CDF/QP banks (`scripts/gen_placeholder_assets.py`) are enough for **NPU timing**; replace with real export tables for meaningful PSNR/bpp.
