@@ -1,8 +1,8 @@
 /* Copyright (c) Microsoft Corporation. Licensed under the MIT License.
  *
- * Pure-CPU AR prior codec for DCVC-RT using ONNX Runtime.
+ * Pure-CPU AR prior codec for DCVC-UF using ONNX Runtime.
  * Runs y_spatial_prior_* networks on CPU and entropy coding via rANS.
- * DCVC-UF: params_fusion is 2*n_ch (scales+means); the y quant steps come from
+ * params_fusion is 2*n_ch (scales+means); the y quant steps come from
  * the caller-supplied per-channel q_enc/q_dec (n_ch each).
  */
 #ifndef DCVC_CPU_AR_CODEC_H
@@ -19,9 +19,11 @@ extern "C" {
 typedef struct DcvcCpuArCodec DcvcCpuArCodec;
 
 /* Create a CPU AR codec for a fixed number of channels:
- *   n_ch = 256 (intra / 4-pass) or 128 (inter / 2-pass, not yet implemented).
+ *   n_ch = 256 (intra / inter 4-pass prior; inter owns its path in
+ *   cpu_inter_pipeline, which shares the same channel width).
  * model_dir: path containing the prior ONNX models and CDF files.
- * CDF files expected: gaussian_cdf.npy, gaussian_cdf_length.npy, gaussian_offset.npy
+ * CDF files expected: gaussian_cdf.npy, gaussian_cdf_length.npy
+ * (zigzag layout; *_offset.npy is unused).
  */
 DcvcCpuArCodec* dcvc_cpu_ar_codec_create(const char* model_dir, int n_ch,
                                           DcvcCpuStatus* out_st);

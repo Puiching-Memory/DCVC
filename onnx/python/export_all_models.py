@@ -91,9 +91,9 @@ def export_torch(net, args, path, in_names, out_name, fixed_size=False):
 
 
 def _remap_cdf_assets(out_dir, cdf_src):
-    """Remap the gaussian / bit-estimator CDFs from DCVC-RT offset-centred
-    order to DCVC-UF zigzag order (value = |sym|*2-(sym>0), symbol 0 at CDF
-    index 0). Writes zigzag-ordered *_cdf.npy / *_cdf_length.npy and drops the
+    """Remap gaussian / bit-estimator CDFs from offset-centred order to
+    DCVC-UF zigzag order (value = |sym|*2-(sym>0), symbol 0 at CDF index 0).
+    Writes zigzag-ordered *_cdf.npy / *_cdf_length.npy and drops the
     *_offset.npy files (zigzag has no offset; the C runtime ignores offset)."""
     import numpy as np
     SCALE = 1 << 16  # CDF precision used by the rANS codec
@@ -110,14 +110,14 @@ def _remap_cdf_assets(out_dir, cdf_src):
         for q in range(qp_num):
             L = int(clen[q])           # number of CDF entries (incl. escape)
             max_value = L - 2          # escape triggers when value >= max_value
-            # RT offset order: CDF entry i is symbol (offset? no) — RT builds the
-            # gaussian CDF symmetric around its centre. The escape (largest
-            # magnitude) sits at the LAST real interval. We rebuild the zigzag
-            # pmf by walking RT symbols [-sym_range .. +sym_range] (+escape).
-            sym_range = (L - 3) // 2    # RT stores 2*sym_range+1 symbols + escape + cdf terminal
+            # Offset-centred order: the gaussian CDF is symmetric around its
+            # centre; the escape (largest magnitude) sits at the LAST real
+            # interval. Rebuild the zigzag pmf by walking symbols
+            # [-sym_range .. +sym_range] (+escape).
+            sym_range = (L - 3) // 2    # 2*sym_range+1 symbols + escape + cdf terminal
             # pmf of each CDF interval (length L-1 intervals over the L entries)
             pmf = np.diff(cdf[q, :L]).astype(np.int64)
-            # RT interval i -> symbol = i - sym_range; the final interval is escape
+            # Interval i -> symbol = i - sym_range; the final interval is escape
             zig = np.zeros(L, dtype=np.int64)
             for i in range(len(pmf)):
                 s = i - sym_range
@@ -213,11 +213,11 @@ def main():
     np.save(os.path.join(out_dir, 'q_scale_y_dec.npy'), model.q_scale_y_dec.detach().cpu().numpy())
     print('saved q_scale_enc/dec + q_scale_y_enc/dec .npy')
 
-    # CDF tables in DCVC-UF zigzag order. The legacy RT assets store the CDFs in
-    # offset-centred order (peak in the middle, offset = -sym_range); the UF
-    # rANS uses value = |sym|*2-(sym>0), so symbol 0 must sit at CDF index 0.
-    # We remap the per-QP gaussian / bit-estimator CDFs from offset order to
-    # zigzag order here and drop the *_offset arrays (zigzag has no offset).
+    # CDF tables in DCVC-UF zigzag order. Source assets may store CDFs in
+    # offset-centred order (peak in the middle); UF rANS uses
+    # value = |sym|*2-(sym>0), so symbol 0 must sit at CDF index 0.
+    # Remap per-QP gaussian / bit-estimator CDFs to zigzag and drop *_offset
+    # arrays (zigzag has no offset).
     _remap_cdf_assets(out_dir, os.path.join(ROOT, 'tensorRT', 'assets', 'decode'))
 
     print('All models and data exported to', out_dir)

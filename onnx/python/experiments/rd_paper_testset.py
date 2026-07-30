@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full RD curve on the DCVC-RT paper test set (UVG + HEVC classes).
+"""Full RD curve on the DCVC-UF paper test set (UVG + HEVC classes).
 
 Reads raw YUV420 8-bit sequences, converts to RGB (BT.709 inverse of the
 codec's RGB->YCbCr), pads to 64-multiple, and runs the C end-to-end intra

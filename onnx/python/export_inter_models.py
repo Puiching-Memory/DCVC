@@ -3,10 +3,10 @@
 against ONNX Runtime.
 
 Produces the HT (HTL / HTS) inter (P-chunk) ONNX models + the per-QP q-bank
-.npy files in <root>/onnx/models/. Unlike the old DCVC-RT sequential P-frame
-pipeline, DCVC-UF encodes a *chunk* of `g_frame_delay` (8) frames into a single
-latent and decodes them in parallel, so the encoder takes the concatenated raw
-chunk frames and the recon head emits all 8 reconstructed frames at once.
+.npy files in <root>/onnx/models/. DCVC-UF encodes a *chunk* of
+`g_frame_delay` (8) frames into a single latent and decodes them in parallel,
+so the encoder takes the concatenated raw chunk frames and the recon head
+emits all 8 reconstructed frames at once.
 
 Each exported model is verified against ONNX Runtime on identical inputs
 (torch.manual_seed(42)): features/latents use torch.randn, frames use

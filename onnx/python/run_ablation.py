@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ablation study: INT8 calibration methods + CLE for DCVC-RT entropy nets.
+"""Ablation study: INT8 calibration methods + CLE for DCVC-UF entropy nets.
 
 Sweeps calibration methods (minmax, entropy, percentile, distribution) with/without
 CLE and with/without output-conv split.  Each config produces a model dir under

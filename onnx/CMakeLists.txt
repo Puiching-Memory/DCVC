@@ -1,7 +1,7 @@
-# DCVC CPU ONNX codec: a standalone, cross-platform (Linux/Windows) DCVC-RT
-# I-frame codec built on ONNX Runtime + the native C rANS library. CPU by
-# default; configure with -DDCVC_ORT_GPU=ON to fetch the CUDA-enabled ONNX
-# Runtime package and enable the CUDA/TensorRT execution providers.
+# DCVC CPU ONNX codec: a standalone, cross-platform (Linux/Windows) DCVC-UF
+# I-frame + P-chunk codec built on ONNX Runtime + the native C rANS library.
+# CPU by default; configure with -DDCVC_ORT_GPU=ON to fetch the CUDA-enabled
+# ONNX Runtime package and enable the CUDA/TensorRT execution providers.
 cmake_minimum_required(VERSION 3.18)
 project(dcvc_onnx C CXX)
 

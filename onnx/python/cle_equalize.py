@@ -6,7 +6,7 @@ per-tensor activation quantization sees a more uniform range distribution.  It
 is exact in FP32: the mathematical output of the network is unchanged.
 
 Only Conv->Conv chains with no activation (or a positively-homogeneous
-activation like ReLU) between them are equalizable.  In the DCVC-RT
+activation like ReLU) between them are equalizable.  In the DCVC-UF
 DepthConv decomposition the pattern
 
     Conv(dc.2, depthwise) -> Conv(dc.3, pointwise)
@@ -134,7 +134,7 @@ def cle_equalize_model(model_path, out_path, iterations=2):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Apply CLE to DCVC-RT entropy-parameter nets")
+    ap = argparse.ArgumentParser(description="Apply CLE to DCVC-UF entropy-parameter nets")
     ap.add_argument("--models-dir", default=os.path.normpath(os.path.join(REPO, "..", "models")))
     ap.add_argument("--out-dir", default=os.path.normpath(os.path.join(REPO, "..", "models_cle")))
     ap.add_argument("--iterations", type=int, default=2)

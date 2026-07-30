@@ -1,4 +1,4 @@
-# Build the pure-CPU DCVC-RT I-frame codec on Windows.
+# Build the pure-CPU DCVC-UF I-frame + P-chunk codec on Windows.
 # Produces build intermediates and a runnable folder under out\.
 #
 # Requires: CMake, Visual Studio 2019/2022 with "Desktop development with C++",

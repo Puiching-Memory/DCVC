@@ -10,11 +10,10 @@ execution provider by default; the CUDA or TensorRT EP can be enabled at runtime
 see "GPU execution" below). Entropy coding uses the same C rANS library as the
 native runtime, so the pipeline is fully independent of TensorRT.
 
-> **Migration status.** The codec was ported from DCVC-RT (sequential P-frames)
-> to DCVC-UF **HT** (chunk-based). Both HT variants (**HT-S** means-only and
-> **HT-L** scales+means spatial prior) are implemented end-to-end and
-> **numerically validated against the PyTorch reference** with the real
-> `cvpr2026` checkpoints:
+> **Validation status.** Both HT variants (**HT-S** means-only and **HT-L**
+> scales+means spatial prior) are implemented end-to-end and **numerically
+> validated against the PyTorch reference** with the real `cvpr2026`
+> checkpoints:
 > - **intra (I-frame)** vs PyTorch `DMCI.forward_one_frame`: bit-exact parity,
 >   PSNR ≈ 116–118 dB (max_abs ~1e-5) at 192×192, 320×192, 128×256.
 > - **inter HT-S / HT-L (P-chunk)** vs PyTorch `DMC.forward_one_frame`: parity
@@ -24,13 +23,12 @@ native runtime, so the pipeline is fully independent of TensorRT.
 > All three `cvpr2026` checkpoints (`image`, `video_hts`, `video_htl`) are
 > present and load with 0 missing / 0 unexpected keys.
 >
-> **Entropy coder (rANS) is now UF-aligned.** The C rANS codec in `rans/` was
-> moved from the DCVC-RT *offset* symbol layout to the DCVC-UF *zigzag* layout
-> (`symbol 0 -> CDF index 0`, expanding outward), and the export script remaps
-> the `gaussian`/`bitest` CDF tables into zigzag order (zeroing the legacy
-> offset arrays). The produced bitstream is therefore **byte-for-byte
-> interoperable** with the official DCVC-UF `py_rans` entropy coder, verified
-> both directions with `test_rans_xop` (see "rANS interop test" below).
+> **Entropy coder (rANS)** uses the DCVC-UF *zigzag* symbol layout
+> (`symbol 0 -> CDF index 0`, expanding outward). The export script writes
+> `gaussian`/`bitest` CDF tables in zigzag order. The produced bitstream is
+> **byte-for-byte interoperable** with the official DCVC-UF `py_rans` entropy
+> coder, verified both directions with `test_rans_xop` (see "rANS interop
+> test" below).
 
 ## Directory layout
 
@@ -372,8 +370,8 @@ cd onnx
 This dynamo-exports all 9 intra nets from `DMCI` (including
 `intra_analysis_standard.onnx` from `model.enc`), writes the QP scales, and
 emits the entropy CDF tables into `models/`. The CDF tables are written in
-DCVC-UF **zigzag** order (`_remap_cdf_assets` remaps them from the RT offset
-layout); the legacy offset arrays are zeroed for API compatibility.
+DCVC-UF **zigzag** order (`_remap_cdf_assets` converts any offset-centred
+source tables); unused offset arrays are omitted.
 
 ## Runtime model files (`models/`)
 

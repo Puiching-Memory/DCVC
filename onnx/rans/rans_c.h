@@ -1,4 +1,4 @@
-/* C API for DCVC-RT rANS entropy coding (wraps C++ RansEncoderLib). */
+/* C API for DCVC-UF rANS entropy coding (wraps C++ RansEncoderLib). */
 #ifndef DCVC_RANS_C_H
 #define DCVC_RANS_C_H
 

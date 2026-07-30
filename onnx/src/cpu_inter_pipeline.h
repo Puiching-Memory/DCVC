@@ -2,9 +2,8 @@
  *
  * Pure-CPU inter (P-chunk) encode/decode pipeline using ONNX Runtime + rANS.
  * Implements the DCVC-UF chunk-based video model (DMC, HT-S / HT-L) 4x prior
- * path. Unlike the old DCVC-RT sequential P-frame codec, this encodes a whole
- * *chunk* of g_frame_delay (8) frames into one latent and reconstructs all 8
- * frames in parallel from a single decoder feature plane.
+ * path: encodes a *chunk* of g_frame_delay (8) frames into one latent and
+ * reconstructs all 8 frames in parallel from a single decoder feature plane.
  *
  * A P-chunk references the previous reference via a feature-memory DPB:
  *   - first P-chunk after an intra frame: feature_adaptor_i(pixel_unshuffle(x_hat_intra))

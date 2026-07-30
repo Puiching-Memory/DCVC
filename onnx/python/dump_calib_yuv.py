@@ -19,10 +19,8 @@ Usage:
   python dump_calib_yuv.py 720p --out /tmp/smoke --seqs Johnny --frames 0 --qps 32
 
 Full fixed-size pack recipe (720p example):
-  python export_all_models.py  --src-root ../DCVC-family/DCVC-RT \\
-      --out-dir models_720p_fp32 --height 720 --width 1280
-  python export_inter_models.py --src-root ../DCVC-family/DCVC-RT \\
-      --out-dir models_720p_fp32 --height 720 --width 1280
+  python export_all_models.py --out-dir models_720p_fp32 --height 720 --width 1280
+  python export_inter_models.py --out-dir models_720p_fp32 --height 720 --width 1280
   python dump_calib_yuv.py 720p --out calib_720p
   python fxp_export_entropy_nets.py --src-dir models_720p_fp32 \\
       --out-dir models_720p --calib-dir calib_720p

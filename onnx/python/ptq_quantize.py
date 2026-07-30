@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""INT8 static PTQ of the DCVC-RT intra entropy-parameter nets.
+"""INT8 static PTQ of the DCVC-UF intra entropy-parameter nets.
 
 Quantizes the 7 networks that produce the rANS entropy parameters
 (hyper_dec, y_prior_fusion, y_spatial_prior_reduction,

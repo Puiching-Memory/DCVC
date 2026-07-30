@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """QAT fine-tune of INT8 backbone (analysis / hyper_enc / synthesis).
 
-Uses the DCVC-RT DMCI checkpoint (368-ch, matches onnx/models). Entropy nets
+Uses the DCVC-UF DMCI checkpoint (384-ch, matches onnx/models). Entropy nets
 stay FP32 (frozen); only Conv2d inside enc / hyper_enc / dec get fake-quant
 (STE, per-tensor act u8 + per-channel weight s8), matching ORT QLinearConv.
 
 Pipeline:
-  1) Load RT checkpoint, wrap backbone Convs with FakeQuant
+  1) Load UF checkpoint, wrap backbone Convs with FakeQuant
   2) Distill + recon loss on random crops (YCbCr, matches C codec)
   3) Export FP32-but-QAT-aware backbone ONNX
   4) Native ORT INT8 PTQ → hybrid pack (FXP entropy + QAT-int8 backbone)
@@ -36,13 +36,12 @@ from PIL import Image
 REPO = os.path.dirname(os.path.abspath(__file__))
 ONNX_DIR = os.path.normpath(os.path.join(REPO, ".."))
 ROOT = os.path.normpath(os.path.join(ONNX_DIR, ".."))
-RT_ROOT = os.path.join(ROOT, "DCVC-family", "DCVC-RT")
-sys.path.insert(0, RT_ROOT)
+sys.path.insert(0, ROOT)
 sys.path.insert(0, REPO)
 
 os.environ.setdefault("SUPPRESS_CUSTOM_KERNEL_WARNING", "1")
 
-from src.models.image_model import DMCI, g_ch_enc_dec  # noqa: E402  (RT)
+from src.models.image_model import DMCI, g_ch_enc_dec  # noqa: E402
 from ptq_dump_calib import rgb_to_ycbcr_c  # noqa: E402
 from ptq_hybrid_backbone_i8 import (  # noqa: E402
     BACKBONE_NETS,
@@ -304,7 +303,7 @@ def dump_calib_from_qat_onnx(fp32_backbone_dir, frames_dir, frames, qps, crop, o
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=os.path.join(ROOT, "checkpoints", "cvpr2025_image.pth.tar"))
+    ap.add_argument("--checkpoint", default=os.path.join(ROOT, "checkpoints", "cvpr2026_image.pth.tar"))
     ap.add_argument("--frames-dir", default=os.path.join(ONNX_DIR, "rd_frames"))
     ap.add_argument("--frames", nargs="+", default=["beauty", "bosphorus", "jockey"])
     ap.add_argument("--holdout", default="jockey",

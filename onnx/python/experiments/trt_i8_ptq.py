@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ModelOpt INT8 PTQ (QDQ) of the full DCVC-RT intra network set for TRT.
+"""ModelOpt INT8 PTQ (QDQ) of the full DCVC-UF intra network set for TRT.
 
 Quantizes the 10 ONNX models used by the C intra end-to-end pipeline
 (onnx/src/cpu_intra_pipeline.c + cpu_ar_codec.c):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated INT8 quantization parameter search for DCVC-RT entropy nets.
+"""Automated INT8 quantization parameter search for DCVC-UF entropy nets.
 
 Three search strategies, all injecting per-tensor activation ranges via ORT's
 calibration_cache mechanism (bypassing ORT's built-in calibration):

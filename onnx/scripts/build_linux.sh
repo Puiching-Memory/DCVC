@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the pure-CPU DCVC-RT I-frame codec on Linux.
+# Build the pure-CPU DCVC-UF I-frame + P-chunk codec on Linux.
 # Produces build intermediates and a runnable folder under out/.
 set -euo pipefail
 

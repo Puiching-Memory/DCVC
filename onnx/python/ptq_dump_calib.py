@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate PTQ calibration data for the DCVC-RT intra entropy-parameter nets.
+"""Generate PTQ calibration data for the DCVC-UF intra entropy-parameter nets.
 
 Reproduces the C encoder-side dataflow (onnx/src/cpu_intra_pipeline.c +
 onnx/src/cpu_ar_codec.c, encode path only) with onnxruntime + numpy and dumps
