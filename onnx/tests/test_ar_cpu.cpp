@@ -57,7 +57,7 @@ int main(int argc, char** argv)
         { dcvc_pause_if_dblclick(); return 1; }
     }
 
-    float *y = NULL, *pf = NULL;
+    float *y = NULL, *pf = NULL, *qy = NULL;
     float* y_hat = NULL;
     float* y_hat_dec = NULL;
     float* y_ref = NULL;
@@ -67,6 +67,8 @@ int main(int argc, char** argv)
         if (read_f32_npy_dims(y_npy, &y, y_dims) != 0) { fprintf(stderr, "failed to read %s\n", y_npy); { dcvc_pause_if_dblclick(); return 1; } }
         if (read_f32_npy_dims(pf_npy, &pf, pf_dims) != 0) { fprintf(stderr, "failed to read %s\n", pf_npy); { dcvc_pause_if_dblclick(); return 1; } }
         n_ch = y_dims[1];
+        qy = (float*)malloc(n_ch * sizeof(float));
+        for (int i = 0; i < n_ch; i++) qy[i] = 1.0f;
         H = y_dims[2];
         W = y_dims[3];
         printf("loaded real data: y %dx%dx%dx%d, pf %dx%dx%dx%d\n",
@@ -74,7 +76,10 @@ int main(int argc, char** argv)
                pf_dims[0], pf_dims[1], pf_dims[2], pf_dims[3]);
     } else {
         y = synth_tensor(n_ch, H, W);
-        pf = synth_tensor(2 * n_ch + 2, H, W);
+        pf = synth_tensor(2 * n_ch, H, W);
+        /* DCVC-UF: per-channel y quant steps (ones = no-op scaling). */
+        qy = (float*)malloc(n_ch * sizeof(float));
+        for (int i = 0; i < n_ch; i++) qy[i] = 1.0f;
     }
 
     y_hat = (float*)malloc(n_ch * H * W * sizeof(float));
@@ -88,14 +93,14 @@ int main(int argc, char** argv)
     uint8_t* stream = NULL;
     size_t stream_size = 0;
 
-    st = dcvc_cpu_ar_codec_encode_y(c, y, pf, H, W, &stream, &stream_size, y_hat);
+    st = dcvc_cpu_ar_codec_encode_y(c, y, pf, qy, qy, H, W, &stream, &stream_size, y_hat);
     if (st != DCVC_CPU_OK) {
         fprintf(stderr, "encode failed: %s\n", dcvc_cpu_status_string(st));
         { dcvc_pause_if_dblclick(); return 1; }
     }
     printf("encode OK: stream_size=%zu bytes\n", stream_size);
 
-    st = dcvc_cpu_ar_codec_decode_y(c, pf, H, W, stream, stream_size, y_hat_dec);
+    st = dcvc_cpu_ar_codec_decode_y(c, pf, qy, qy, H, W, stream, stream_size, y_hat_dec);
     if (st != DCVC_CPU_OK) {
         fprintf(stderr, "decode failed: %s\n", dcvc_cpu_status_string(st));
         { dcvc_pause_if_dblclick(); return 1; }

@@ -89,23 +89,33 @@ static int run_roundtrip(const char* model_dir, int W, int H, int qp, int nframe
     long px = (long)3 * W * H;
     double total_bits = 0.0, total_psnr = 0.0;
     printf("frame  type  bytes   bpp    psnr(dB)\n");
+    int dec_count = 0;
     for (int f = 0; f < nframes; f++) {
         float* frame = synth_frame(H, W, (unsigned)(f * 7919 + 1));
         uint8_t* pkt = NULL; size_t pkt_size = 0; dcvc_frame_type_t ftype;
         st = dcvc_encoder_encode(enc, frame, (f == 0), &pkt, &pkt_size, &ftype);
         if (st != DCVC_OK) { fprintf(stderr, "encode frame %d: %s\n", f, dcvc_status_string(st)); free(frame); break; }
+        if (pkt_size == 0) { free(frame); continue; }  /* HT: buffered inter frame */
 
         int pw = 0, ph = 0; dcvc_frame_type_t pt;
         dcvc_packet_probe(pkt, pkt_size, &pw, &ph, NULL, &pt);
-        float* rec = (float*)malloc((size_t)3 * pw * ph * sizeof(float));
+        /* HT: an inter packet decodes to DCVC_FRAME_DELAY frames. */
+        int nframes_pkt = (pt == DCVC_FRAME_INTRA) ? 1 : DCVC_FRAME_DELAY;
+        float* rec = (float*)malloc((size_t)3 * pw * ph * nframes_pkt * sizeof(float));
         dcvc_status_t dst = dcvc_decoder_decode(dec, pkt, pkt_size, rec, NULL, NULL, &pt);
-        double psnr = (dst == DCVC_OK) ? rgb_psnr(frame, rec, px) : 0.0;
-        total_bits += 8.0 * pkt_size; total_psnr += psnr;
-        printf("%4d   %s  %6zu  %5.3f  %7.3f\n", f,
-               ftype == DCVC_FRAME_INTRA ? "I" : "P", pkt_size,
-               8.0 * pkt_size / (double)(W * H), psnr);
+        if (dst == DCVC_OK) {
+            for (int j = 0; j < nframes_pkt; j++) {
+                double psnr = rgb_psnr(frame, rec + (size_t)j*3*pw*ph, px);
+                total_psnr += psnr; dec_count++;
+                printf("%4d   %s  %6zu  %5.3f  %7.3f\n", f + j,
+                       pt == DCVC_FRAME_INTRA ? "I" : "P", pkt_size,
+                       8.0 * pkt_size / (double)(W * H * nframes_pkt), psnr);
+            }
+            total_bits += 8.0 * pkt_size;
+        }
         dcvc_packet_free(pkt); free(rec); free(frame);
     }
+    nframes = dec_count > 0 ? dec_count : nframes;
     printf("avg bpp=%.4f  avg psnr=%.3f dB\n",
            total_bits / ((double)nframes * W * H), total_psnr / nframes);
 
@@ -145,6 +155,7 @@ static int run_emit(const char* model_dir, const char* path,
         uint8_t* pkt = NULL; size_t n = 0; dcvc_frame_type_t t;
         dcvc_status_t st = dcvc_encoder_encode(enc, frame, (fr == 0), &pkt, &n, &t);
         if (st != DCVC_OK) { fprintf(stderr, "encode %d: %s\n", fr, dcvc_status_string(st)); free(frame); fclose(f); return 1; }
+        if (n == 0) { dcvc_packet_free(pkt); free(frame); continue; }  /* HT: buffered inter frame */
 
         uint8_t hdr[4]; put_u32le(hdr, (unsigned)n);
         fwrite(hdr, 1, 4, f);
@@ -190,11 +201,12 @@ static int run_replay(const char* model_dir, const char* path) {
 
         int W = 0, H = 0; dcvc_frame_type_t t;
         dcvc_packet_probe(pkt, n, &W, &H, NULL, &t);
-        float* rec = (float*)malloc((size_t)3 * W * H * sizeof(float));
+        int npkt = (t == DCVC_FRAME_INTRA) ? 1 : DCVC_FRAME_DELAY;
+        float* rec = (float*)malloc((size_t)3 * W * H * npkt * sizeof(float));
         dcvc_status_t st = dcvc_decoder_decode(dec, pkt, n, rec, &W, &H, &t);
         const char* res = (st == DCVC_OK) ? "OK" : dcvc_status_string(st);
-        printf("replay %2d  %s  %ux%u  %s\n", fr,
-               t == DCVC_FRAME_INTRA ? "I" : "P", (unsigned)W, (unsigned)H, res);
+        printf("replay %2d  %s  %ux%u  %d frames  %s\n", fr,
+               t == DCVC_FRAME_INTRA ? "I" : "P", (unsigned)W, (unsigned)H, npkt, res);
         if (st != DCVC_OK) ok = 0;
         free(rec); free(pkt); fr++;
     }

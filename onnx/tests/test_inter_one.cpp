@@ -47,17 +47,28 @@ int main(int argc,char**argv){
     if(load_f32(argv[1],&ref,rd)||load_f32(argv[2],&x,xd)){fprintf(stderr,"npy read fail\n");{ dcvc_pause_if_dblclick(); return 1; }}
     int H=rd[2],W=rd[3];
     DcvcCpuStatus st;
-    DcvcCpuInterPipeline*p=dcvc_cpu_inter_pipeline_create(model_dir,H,W,qp,&st);
+    int is_hts = !(getenv("DCVC_IS_HTS") && getenv("DCVC_IS_HTS")[0]=='0');
+    DcvcCpuInterPipeline*p=dcvc_cpu_inter_pipeline_create(model_dir,H,W,qp,is_hts,&st);
+    printf("inter variant: %s\n", is_hts ? "HT-S" : "HT-L");
     if(!p){fprintf(stderr,"create fail: %s\n",dcvc_cpu_status_string(st));{ dcvc_pause_if_dblclick(); return 1; }}
-    float*xhat=(float*)malloc(3*H*W*sizeof(float));
+    /* HT chunk: DCVC_FRAME_DELAY frames. If x is a single frame, replicate it to
+     * fill the chunk; if x already holds FRAMES frames, use it directly. */
+    int single = !(xd[0]==1 || xd[0]==DCVC_FRAME_DELAY);
+    float* chunk=NULL;
+    if (!single) { chunk=x; }
+    else {
+        chunk=(float*)malloc((size_t)DCVC_FRAME_DELAY*3*H*W*sizeof(float));
+        for(int i=0;i<DCVC_FRAME_DELAY;i++) memcpy(chunk+i*3*H*W,x,3*H*W*sizeof(float));
+    }
+    float*xhat=(float*)malloc((size_t)DCVC_FRAME_DELAY*3*H*W*sizeof(float));
     uint8_t*str=NULL;size_t strn=0;
-    st=dcvc_cpu_inter_pipeline_encode(p,x,ref,&str,&strn,xhat);
+    st=dcvc_cpu_inter_pipeline_encode(p,chunk,1,ref,&str,&strn,xhat);
     if(st){fprintf(stderr,"encode fail: %s\n",dcvc_cpu_status_string(st));{ dcvc_pause_if_dblclick(); return 1; }}
     if (out_bin) {
         FILE* f=fopen(out_bin,"wb"); if(!f){fprintf(stderr,"cannot write %s\n",out_bin);{ dcvc_pause_if_dblclick(); return 1; }}
         fwrite(str,1,strn,f); fclose(f);
     }
-    printf("P-frame stream=%zu bytes; x_hat dumped\n",strn);
-    free(ref);free(x);free(xhat);free(str);dcvc_cpu_inter_pipeline_destroy(p);
+    printf("P-chunk stream=%zu bytes; x_hat[0..%d] dumped\n",strn,DCVC_FRAME_DELAY);
+    free(ref);free(x);free(xhat);free(str);if(chunk!=x)free(chunk);dcvc_cpu_inter_pipeline_destroy(p);
     { dcvc_pause_if_dblclick(); return 0; }
 }

@@ -2,6 +2,8 @@
  *
  * Pure-CPU AR prior codec for DCVC-RT using ONNX Runtime.
  * Runs y_spatial_prior_* networks on CPU and entropy coding via rANS.
+ * DCVC-UF: params_fusion is 2*n_ch (scales+means); the y quant steps come from
+ * the caller-supplied per-channel q_enc/q_dec (n_ch each).
  */
 #ifndef DCVC_CPU_AR_CODEC_H
 #define DCVC_CPU_AR_CODEC_H
@@ -30,6 +32,7 @@ void dcvc_cpu_ar_codec_destroy(DcvcCpuArCodec* c);
  * If y_hat_out is non-NULL, writes the decoded y_hat (same shape as y) into it. */
 DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
                                           const float* y, const float* params_fusion,
+                                          const float* q_enc, const float* q_dec,
                                           int H, int W,
                                           uint8_t** out_stream, size_t* out_size,
                                           float* y_hat_out);
@@ -38,6 +41,7 @@ DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
  * y_hat_out must be allocated by the caller [n_ch * H * W floats]. */
 DcvcCpuStatus dcvc_cpu_ar_codec_decode_y(DcvcCpuArCodec* c,
                                           const float* params_fusion,
+                                          const float* q_enc, const float* q_dec,
                                           int H, int W,
                                           const uint8_t* stream, size_t stream_size,
                                           float* y_hat_out);

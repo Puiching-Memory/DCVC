@@ -118,6 +118,8 @@ struct dcvc_config {
     int threads = 0;       /* 0 = auto */
     int exec_provider = 0; /* 0 cpu, 1 cuda, 2 trt */
     int crc = 1;           /* on by default */
+    int low_memory = 0;    /* low-memory mode: shrink ORT arena, defer inter */
+    int is_hts = 1;        /* DCVC-UF HT variant: 1 = HT-S (default), 0 = HT-L */
 };
 
 extern "C" {
@@ -147,6 +149,16 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_crc(dcvc_config_t* cfg, int ena
     cfg->crc = enable ? 1 : 0;
     return DCVC_OK;
 }
+DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_low_memory(dcvc_config_t* cfg, int enable) {
+    if (!cfg) return DCVC_ERR_INVALID_ARG;
+    cfg->low_memory = enable ? 1 : 0;
+    return DCVC_OK;
+}
+DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_model_structure(dcvc_config_t* cfg, int is_hts) {
+    if (!cfg) return DCVC_ERR_INVALID_ARG;
+    cfg->is_hts = is_hts ? 1 : 0;
+    return DCVC_OK;
+}
 
 /* ========================================================================= *
  *  Session                                                                   *
@@ -158,6 +170,8 @@ struct dcvc_session {
     int threads = 0;
     int exec_provider = 0;
     int crc = 1;
+    int low_memory = 0;
+    int is_hts = 1;
     std::string last_error;
 };
 
@@ -174,6 +188,9 @@ static void apply_runtime_knobs(const dcvc_session_t* s) {
         std::snprintf(buf, sizeof(buf), "%d", s->threads);
         set_env_once("DCVC_ORT_INTRA_OP_THREADS", buf);
     }
+    if (s->low_memory) {
+        set_env_once("DCVC_LOW_MEMORY", "1");
+    }
 }
 
 DCVC_API dcvc_status_t DCVC_CALL dcvc_session_create(const dcvc_config_t* cfg,
@@ -187,6 +204,8 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_session_create(const dcvc_config_t* cfg,
         s->threads = cfg->threads;
         s->exec_provider = cfg->exec_provider;
         s->crc = cfg->crc;
+        s->low_memory = cfg->low_memory;
+    s->is_hts = cfg->is_hts;
         apply_runtime_knobs(s);
         *out = s;
         return DCVC_OK;
@@ -238,10 +257,26 @@ struct PipelinePair {
 };
 
 /* Ensure pp holds the intra+inter pipelines for qp at the given geometry.
- * Reuses the cached pair when qp matches; otherwise tears down and rebuilds. */
+ * Reuses the cached pair when qp matches; otherwise tears down and rebuilds.
+ * When need_inter is false (low-memory deferred mode), only the intra pipeline
+ * is created; the inter pipeline is instantiated on first P-frame demand. */
 static dcvc_status_t ensure_pipelines(dcvc_session_t* sess, PipelinePair* pp,
-                                      int H, int W, int qp) {
-    if (pp->qp == qp && pp->intra && pp->inter) return DCVC_OK;
+                                      int H, int W, int qp, bool need_inter = true) {
+    if (pp->qp == qp && pp->intra && (pp->inter || !need_inter)) return DCVC_OK;
+
+    /* If only inter is missing and intra is still valid, just add inter. */
+    if (pp->qp == qp && pp->intra && need_inter && !pp->inter) {
+        DcvcCpuStatus st = DCVC_CPU_OK;
+        pp->inter = dcvc_cpu_inter_pipeline_create(sess->model_dir.c_str(), H, W, qp, sess->is_hts, &st);
+        if (!pp->inter) {
+            sess->last_error = std::string("inter pipeline create failed: ") +
+                               dcvc_cpu_status_string(st);
+            dcvc_emit_log(DCVC_LOG_ERROR, sess->last_error.c_str());
+            return map_status(st);
+        }
+        return DCVC_OK;
+    }
+
     pp->destroy();
 
     DcvcCpuStatus st = DCVC_CPU_OK;
@@ -252,13 +287,15 @@ static dcvc_status_t ensure_pipelines(dcvc_session_t* sess, PipelinePair* pp,
         dcvc_emit_log(DCVC_LOG_ERROR, sess->last_error.c_str());
         return map_status(st);
     }
-    pp->inter = dcvc_cpu_inter_pipeline_create(sess->model_dir.c_str(), H, W, qp, &st);
-    if (!pp->inter) {
-        pp->destroy();
-        sess->last_error = std::string("inter pipeline create failed: ") +
-                           dcvc_cpu_status_string(st);
-        dcvc_emit_log(DCVC_LOG_ERROR, sess->last_error.c_str());
-        return map_status(st);
+    if (need_inter) {
+        pp->inter = dcvc_cpu_inter_pipeline_create(sess->model_dir.c_str(), H, W, qp, sess->is_hts, &st);
+        if (!pp->inter) {
+            pp->destroy();
+            sess->last_error = std::string("inter pipeline create failed: ") +
+                               dcvc_cpu_status_string(st);
+            dcvc_emit_log(DCVC_LOG_ERROR, sess->last_error.c_str());
+            return map_status(st);
+        }
     }
     pp->qp = qp;
     return DCVC_OK;
@@ -277,10 +314,18 @@ struct dcvc_encoder {
     int have_ref = 0;
     int bytes_per_frame = 0;
 
+    /* HT chunk buffering: accumulate DCVC_FRAME_DELAY frames, emit one chunk
+     * packet on the boundary. chunk_reset marks the first chunk after an intra
+     * frame (ref is used as that chunk's reference). */
+    float* chunk_buf = nullptr;   /* [FRAMES * 3*H*W] */
+    float* chunk_rec = nullptr;   /* [FRAMES * 3*H*W] reconstructed chunk */
+    int chunk_cnt = 0;
+    int chunk_reset = 0;
+
     dcvc_encoder() = default;
     ~dcvc_encoder() {
         pp.destroy();
-        std::free(ref);
+        std::free(ref); std::free(chunk_buf); std::free(chunk_rec);
         if (sess) dcvc_session_unref(sess);
     }
 };
@@ -299,10 +344,13 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_encoder_create(dcvc_session_t* sess,
         e->sess = dcvc_session_ref(sess);
         e->W = width; e->H = height; e->qp = qp;
         e->bytes_per_frame = width * height * 3;
-        dcvc_status_t st = ensure_pipelines(sess, &e->pp, height, width, qp);
+        dcvc_status_t st = ensure_pipelines(sess, &e->pp, height, width, qp,
+                                             !sess->low_memory);
         if (st != DCVC_OK) { delete e; return st; }
         e->ref = (float*)std::calloc((size_t)e->bytes_per_frame, sizeof(float));
-        if (!e->ref) { delete e; return DCVC_ERR_OOM; }
+        e->chunk_buf = (float*)std::calloc((size_t)DCVC_FRAME_DELAY * e->bytes_per_frame, sizeof(float));
+        e->chunk_rec  = (float*)std::calloc((size_t)DCVC_FRAME_DELAY * e->bytes_per_frame, sizeof(float));
+        if (!e->ref || !e->chunk_buf || !e->chunk_rec) { delete e; return DCVC_ERR_OOM; }
         *out = e;
         return DCVC_OK;
     } catch (const std::bad_alloc&) {
@@ -314,7 +362,7 @@ DCVC_API void DCVC_CALL dcvc_encoder_destroy(dcvc_encoder_t* enc) { delete enc; 
 
 DCVC_API dcvc_status_t DCVC_CALL dcvc_encoder_reset(dcvc_encoder_t* enc) {
     if (!enc) return DCVC_ERR_INVALID_ARG;
-    enc->have_ref = 0;
+    enc->have_ref = 0; enc->chunk_cnt = 0; enc->chunk_reset = 0;
     return DCVC_OK;
 }
 
@@ -331,30 +379,64 @@ static dcvc_status_t encode_impl(dcvc_encoder_t* enc, const float* frame,
     /* qp override: rebuild the pipeline pair on change (one-time cost). */
     if (qp != enc->qp) {
         if (qp < 0 || qp > 63) return DCVC_ERR_INVALID_ARG;
-        dcvc_status_t st = ensure_pipelines(sess, &enc->pp, enc->H, enc->W, qp);
+        dcvc_status_t st = ensure_pipelines(sess, &enc->pp, enc->H, enc->W, qp,
+                                             !sess->low_memory);
         if (st != DCVC_OK) return st;
         enc->qp = qp;
         enc->have_ref = 0;   /* quantizer changed: invalidate the DPB */
     }
 
     int intra = force_intra || !enc->have_ref;
+
     uint8_t* raw = nullptr;
     size_t raw_size = 0;
-    DcvcCpuStatus cst;
+    DcvcCpuStatus cst = DCVC_CPU_OK;
+
     if (intra) {
+        /* An intra frame resyncs the DPB: drop any pending partial chunk and
+         * mark the next inter chunk as the first (ref = intra reconstruction). */
+        enc->chunk_cnt = 0;
+        enc->chunk_reset = 1;
         cst = dcvc_cpu_intra_pipeline_encode(enc->pp.intra, frame,
                                              &raw, &raw_size, enc->ref);
+        if (cst != DCVC_CPU_OK) {
+            std::free(raw);
+            sess->last_error = std::string("intra encode failed: ") +
+                               dcvc_cpu_status_string(cst);
+            return map_status(cst);
+        }
+        enc->have_ref = 1;
     } else {
-        cst = dcvc_cpu_inter_pipeline_encode(enc->pp.inter, frame, enc->ref,
-                                             &raw, &raw_size, enc->ref);
+        /* Low-memory deferred inter: create on first P-frame demand. */
+        if (!enc->pp.inter) {
+            dcvc_status_t st = ensure_pipelines(sess, &enc->pp, enc->H, enc->W, enc->qp, true);
+            if (st != DCVC_OK) return st;
+        }
+        /* HT chunk buffering: accumulate DCVC_FRAME_DELAY frames, emit one
+         * chunk packet on the boundary. Non-boundary frames return DCVC_OK
+         * with *out_size == 0 (no packet emitted this call). */
+        std::memcpy(enc->chunk_buf + (size_t)enc->chunk_cnt * enc->bytes_per_frame,
+                    frame, (size_t)enc->bytes_per_frame * sizeof(float));
+        enc->chunk_cnt++;
+        if (enc->chunk_cnt < DCVC_FRAME_DELAY) {
+            if (out_type) *out_type = DCVC_FRAME_INTER;
+            *out_size = 0;
+            return DCVC_OK;
+        }
+        cst = dcvc_cpu_inter_pipeline_encode(enc->pp.inter, enc->chunk_buf,
+                                             enc->chunk_reset,
+                                             enc->chunk_reset ? enc->ref : nullptr,
+                                             &raw, &raw_size, enc->chunk_rec);
+        if (cst != DCVC_CPU_OK) {
+            std::free(raw);
+            sess->last_error = std::string("inter encode failed: ") +
+                               dcvc_cpu_status_string(cst);
+            return map_status(cst);
+        }
+        enc->chunk_reset = 0;
+        enc->chunk_cnt = 0;
+        enc->have_ref = 1;
     }
-    if (cst != DCVC_CPU_OK) {
-        std::free(raw);
-        sess->last_error = std::string(intra ? "intra" : "inter") + " encode failed: " +
-                           dcvc_cpu_status_string(cst);
-        return map_status(cst);
-    }
-    enc->have_ref = 1;
 
     dcvc_container_header hdr{};
     hdr.frame_type = (uint8_t)(intra ? DCVC_FRAME_INTRA : DCVC_FRAME_INTER);
@@ -407,21 +489,26 @@ struct dcvc_decoder {
     int ref_cap = 0;        /* floats allocated in ref */
     int have_ref = 0;
     int ref_W = 0, ref_H = 0;
+    int inter_reset = 0;            /* HT: first inter chunk after an intra */
+    float* chunk_out = nullptr;     /* HT: [FRAMES * 3*H*W] decoded chunk */
 
     dcvc_decoder() = default;
     ~dcvc_decoder() {
         pp.destroy();
-        std::free(ref);
+        std::free(ref); std::free(chunk_out);
         if (sess) dcvc_session_unref(sess);
     }
 
-    /* Grow ref to hold 3*H*W floats if needed. */
+    /* Grow ref (and the HT chunk buffer) to hold 3*H*W floats if needed. */
     dcvc_status_t ensure_ref(int H, int W) {
         int need = H * W * 3;
         if (need > ref_cap) {
             float* p = (float*)std::realloc(ref, (size_t)need * sizeof(float));
             if (!p) return DCVC_ERR_OOM;
             ref = p; ref_cap = need;
+            std::free(chunk_out);
+            chunk_out = (float*)std::calloc((size_t)DCVC_FRAME_DELAY * need, sizeof(float));
+            if (!chunk_out) return DCVC_ERR_OOM;
         }
         return DCVC_OK;
     }
@@ -448,7 +535,7 @@ DCVC_API void DCVC_CALL dcvc_decoder_destroy(dcvc_decoder_t* dec) { delete dec; 
 
 DCVC_API dcvc_status_t DCVC_CALL dcvc_decoder_reset(dcvc_decoder_t* dec) {
     if (!dec) return DCVC_ERR_INVALID_ARG;
-    dec->have_ref = 0;
+    dec->have_ref = 0; dec->inter_reset = 0;
     return DCVC_OK;
 }
 
@@ -480,9 +567,11 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_decoder_decode(dcvc_decoder_t* dec,
     if (out_type)   *out_type = (dcvc_frame_type_t)hdr.frame_type;
 
     /* Rebuild the pipeline pair when geometry or qp changes. An intra frame
-     * also implicitly resyncs the DPB. */
+     * also implicitly resyncs the DPB. In low-memory mode, defer inter. */
     if (dec->cur_W != W || dec->cur_H != H || dec->cur_qp != qp) {
-        st = ensure_pipelines(sess, &dec->pp, H, W, qp);
+        bool need_inter = !sess->low_memory ||
+                          (hdr.frame_type == DCVC_FRAME_INTER);
+        st = ensure_pipelines(sess, &dec->pp, H, W, qp, need_inter);
         if (st != DCVC_OK) return st;
         dec->cur_W = W; dec->cur_H = H; dec->cur_qp = qp;
     }
@@ -494,13 +583,26 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_decoder_decode(dcvc_decoder_t* dec,
         cst = dcvc_cpu_intra_pipeline_decode(dec->pp.intra, payload, hdr.payload_len, dec->ref);
         dec->have_ref = 1;
         dec->ref_W = W; dec->ref_H = H;
+        dec->inter_reset = 1;
     } else {
         if (!dec->have_ref || dec->ref_W != W || dec->ref_H != H) {
             sess->last_error = "inter frame decoded without a matching reference";
             return DCVC_ERR_FORMAT;
         }
+        /* Low-memory deferred inter: create on first P-frame demand. */
+        if (!dec->pp.inter) {
+            st = ensure_pipelines(sess, &dec->pp, H, W, qp, true);
+            if (st != DCVC_OK) return st;
+        }
+        /* HT: an inter packet decodes to DCVC_FRAME_DELAY frames. The first
+         * chunk after an intra references the intra reconstruction; thereafter
+         * the pipeline carries the feature-memory DPB internally. out_frame
+         * must be sized for DCVC_FRAME_DELAY * 3*H*W floats. */
         cst = dcvc_cpu_inter_pipeline_decode(dec->pp.inter, payload, hdr.payload_len,
-                                             dec->ref, dec->ref);
+                                             dec->inter_reset,
+                                             dec->inter_reset ? dec->ref : nullptr,
+                                             dec->chunk_out);
+        dec->inter_reset = 0;
         dec->ref_W = W; dec->ref_H = H;
     }
     if (cst != DCVC_CPU_OK) {
@@ -509,7 +611,12 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_decoder_decode(dcvc_decoder_t* dec,
         return map_status(cst);
     }
 
-    std::memcpy(out_frame, dec->ref, (size_t)W * H * 3 * sizeof(float));
+    size_t frame_bytes = (size_t)W * H * 3 * sizeof(float);
+    if (hdr.frame_type == DCVC_FRAME_INTRA) {
+        std::memcpy(out_frame, dec->ref, frame_bytes);
+    } else {
+        std::memcpy(out_frame, dec->chunk_out, (size_t)DCVC_FRAME_DELAY * frame_bytes);
+    }
     return DCVC_OK;
 }
 

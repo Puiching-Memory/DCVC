@@ -46,6 +46,11 @@ static double psnr(const float* a, const float* b, int n) {
     mse /= n;
     return mse <= 0 ? 999.0 : 10.0 * log10(1.0 / mse);
 }
+/* HT variant: env DCVC_IS_HTS selects HT-S (1, default) or HT-L (0). */
+static int pick_is_hts(void) {
+    const char* e = getenv("DCVC_IS_HTS");
+    return (e && e[0] == '0') ? 0 : 1;
+}
 
 /* round-trip a synthetic sequence in-process */
 static int mode_roundtrip(int argc, char** argv) {
@@ -60,8 +65,10 @@ static int mode_roundtrip(int argc, char** argv) {
            N, H, W, qp_i, qp_p, model_dir);
     DcvcCpuStatus st;
     DcvcCpuIntraPipeline* intra = dcvc_cpu_intra_pipeline_create(model_dir, H, W, qp_i, &st);
-    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, H, W, qp_p, &st);
+    int is_hts = pick_is_hts();
+    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, H, W, qp_p, is_hts, &st);
     if (!intra || !inter) { fprintf(stderr, "pipeline create failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
+    printf("inter variant: %s\n", is_hts ? "HT-S" : "HT-L");
     float *x = synth_frame(H, W, 0), *x_hat_enc = (float*)malloc(3*H*W*sizeof(float));
     float *x_hat_dec = (float*)malloc(3*H*W*sizeof(float)), *ref = (float*)malloc(3*H*W*sizeof(float));
     if (!x || !x_hat_enc || !x_hat_dec || !ref) { fprintf(stderr, "oom\n"); return 1; }
@@ -72,23 +79,32 @@ static int mode_roundtrip(int argc, char** argv) {
     if (st) { fprintf(stderr, "intra decode failed\n"); return 1; }
     printf("frame 0 (I): stream=%zu B  PSNR=%6.2f dB", s0n, psnr(x, x_hat_enc, 3*H*W));
     { double md=0; for (int i=0;i<3*H*W;i++){double d=fabs(x_hat_enc[i]-x_hat_dec[i]); if(d>md)md=d;} printf("  enc-dec maxdiff=%.2e\n", md); }
-    size_t total = s0n; memcpy(ref, x_hat_enc, 3*H*W*sizeof(float));
-    free(s0); free(x);
-    for (int f = 1; f < N; f++) {
-        x = synth_frame(H, W, f);
-        uint8_t* sf = NULL; size_t sfn = 0;
-        st = dcvc_cpu_inter_pipeline_encode(inter, x, ref, &sf, &sfn, x_hat_enc);
-        if (st) { fprintf(stderr, "inter encode frame %d failed: %s\n", f, dcvc_cpu_status_string(st)); return 1; }
-        st = dcvc_cpu_inter_pipeline_decode(inter, sf, sfn, ref, x_hat_dec);
-        if (st) { fprintf(stderr, "inter decode frame %d failed: %s\n", f, dcvc_cpu_status_string(st)); return 1; }
-        double md=0; for (int i=0;i<3*H*W;i++){double d=fabs(x_hat_enc[i]-x_hat_dec[i]); if(d>md)md=d;}
-        printf("frame %d (P): stream=%6zu B  PSNR=%6.2f dB  enc-dec maxdiff=%.2e\n",
-               f, sfn, psnr(x, x_hat_enc, 3*H*W), md);
-        total += sfn;
-        if (md > 1e-4) { fprintf(stderr, "ERROR: frame %d enc-dec mismatch\n", f); return 1; }
-        memcpy(ref, x_hat_enc, 3*H*W*sizeof(float));
-        free(sf); free(x);
+    /* HT chunk: encode DCVC_FRAME_DELAY frames as one P-chunk (reset=1, the
+     * first chunk references the intra reconstruction). */
+    size_t per = (size_t)3*H*W;
+    float* chunk = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+    float* xhat_chunk = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+    float* xdec_chunk = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+    if (!chunk || !xhat_chunk || !xdec_chunk) { fprintf(stderr, "oom\n"); return 1; }
+    for (int i = 0; i < DCVC_FRAME_DELAY; i++) {
+        float* fr = synth_frame(H, W, i + 1);
+        memcpy(chunk + i * per, fr, per * sizeof(float)); free(fr);
     }
+    uint8_t* sf = NULL; size_t sfn = 0;
+    st = dcvc_cpu_inter_pipeline_encode(inter, chunk, 1, ref, &sf, &sfn, xhat_chunk);
+    if (st) { fprintf(stderr, "inter chunk encode failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
+    st = dcvc_cpu_inter_pipeline_decode(inter, sf, sfn, 1, ref, xdec_chunk);
+    if (st) { fprintf(stderr, "inter chunk decode failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
+    size_t total = s0n + sfn;
+    for (int i = 0; i < DCVC_FRAME_DELAY; i++) {
+        double md=0;
+        for (size_t k = 0; k < per; k++){double d=fabs(xhat_chunk[i*per+k]-xdec_chunk[i*per+k]); if(d>md)md=d;}
+        printf("frame %d (P): enc-dec maxdiff=%.2e\n", i+1, md);
+        if (md > 1e-4) { fprintf(stderr, "ERROR: chunk frame %d enc-dec mismatch\n", i+1); return 1; }
+    }
+    printf("P-chunk (%d frames): stream=%6zu B\n", DCVC_FRAME_DELAY, sfn);
+    free(sf); free(chunk); free(xhat_chunk); free(xdec_chunk);
+    (void)N;
     printf("total stream = %zu B (%.2f KB), %.0f B/frame avg\n", total, total/1024.0, (double)total/N);
     printf("PASS\n");
     dcvc_cpu_intra_pipeline_destroy(intra);
@@ -186,8 +202,9 @@ static int mode_encode(int argc, char** argv)
 
     DcvcCpuStatus st;
     DcvcCpuIntraPipeline* intra = dcvc_cpu_intra_pipeline_create(model_dir, H, W, qp_i, &st);
-    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, H, W, qp_p, &st);
+    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, H, W, qp_p, pick_is_hts(), &st);
     if (!intra || !inter) { fprintf(stderr, "pipeline create failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
+    printf("inter variant: %s\n", pick_is_hts() ? "HT-S" : "HT-L");
 
     FILE* out = fopen(bin, "wb");
     if (!out) { fprintf(stderr, "cannot write %s\n", bin); return 1; }
@@ -203,27 +220,48 @@ static int mode_encode(int argc, char** argv)
     if (!ref || !x_hat) { fprintf(stderr, "oom\n"); return 1; }
 
     size_t total = 0;
+    size_t per = (size_t)3 * H * W;
+    float* chunk = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+    int chunk_cnt = 0, chunk_reset = 0;
     for (int f = 0; f < N; f++) {
         set_dump_frame(f);
         int is_intra = (gop <= 0) ? (f == 0) : (f % gop == 0);
         int dims[3];
         float* x = load_frame(npy, f, dims, &H, &W);
         if (!x) { fprintf(stderr, "failed to load frame %d\n", f); return 1; }
-        uint8_t* stream = NULL; size_t sfn = 0;
         if (is_intra) {
+            /* flush any pending partial chunk before an intra resync */
+            uint8_t* stream = NULL; size_t sfn = 0;
             st = dcvc_cpu_intra_pipeline_encode(intra, x, &stream, &sfn, x_hat);
+            free(x);
+            if (st) { fprintf(stderr, "encode frame %d failed: %s\n", f, dcvc_cpu_status_string(st)); return 1; }
+            uint32_t len = (uint32_t)sfn;
+            fwrite(&len, 4, 1, out); fwrite(stream, 1, sfn, out);
+            total += sfn;
+            printf("frame %d (I): %zu bytes\n", f, sfn);
+            memcpy(ref, x_hat, per * sizeof(float));
+            free(stream);
+            chunk_cnt = 0; chunk_reset = 1;
         } else {
-            st = dcvc_cpu_inter_pipeline_encode(inter, x, ref, &stream, &sfn, x_hat);
+            memcpy(chunk + (size_t)chunk_cnt * per, x, per * sizeof(float));
+            free(x);
+            if (++chunk_cnt == DCVC_FRAME_DELAY) {
+                uint8_t* stream = NULL; size_t sfn = 0;
+                float* xhat_c = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+                st = dcvc_cpu_inter_pipeline_encode(inter, chunk, chunk_reset,
+                                                    chunk_reset ? ref : NULL,
+                                                    &stream, &sfn, xhat_c);
+                if (st) { fprintf(stderr, "encode chunk@%d failed: %s\n", f, dcvc_cpu_status_string(st)); free(xhat_c); return 1; }
+                uint32_t len = (uint32_t)sfn;
+                fwrite(&len, 4, 1, out); fwrite(stream, 1, sfn, out);
+                total += sfn;
+                printf("chunk@%d (P x%d): %zu bytes\n", f, DCVC_FRAME_DELAY, sfn);
+                free(xhat_c); free(stream);
+                chunk_cnt = 0; chunk_reset = 0;
+            }
         }
-        free(x);
-        if (st) { fprintf(stderr, "encode frame %d failed: %s\n", f, dcvc_cpu_status_string(st)); return 1; }
-        uint32_t len = (uint32_t)sfn;
-        fwrite(&len, 4, 1, out); fwrite(stream, 1, sfn, out);
-        total += sfn;
-        printf("frame %d (%s): %zu bytes\n", f, is_intra ? "I" : "P", sfn);
-        memcpy(ref, x_hat, 3 * H * W * sizeof(float));
-        free(stream);
     }
+    free(chunk);
     fclose(out);
     dcvc_cpu_intra_pipeline_destroy(intra);
     dcvc_cpu_inter_pipeline_destroy(inter);
@@ -253,7 +291,7 @@ static int mode_decode(int argc, char** argv)
     const char* model_dir = resolve_model_dir("intra_analysis_standard.onnx");
     DcvcCpuStatus st;
     DcvcCpuIntraPipeline* intra = dcvc_cpu_intra_pipeline_create(model_dir, (int)H, (int)W, (int)qp_i, &st);
-    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, (int)H, (int)W, (int)qp_p, &st);
+    DcvcCpuInterPipeline* inter = dcvc_cpu_inter_pipeline_create(model_dir, (int)H, (int)W, (int)qp_p, pick_is_hts(), &st);
     if (!intra || !inter) { fprintf(stderr, "pipeline create failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
 
     float* ref = (float*)malloc(3 * H * W * sizeof(float));
@@ -263,22 +301,33 @@ static int mode_decode(int argc, char** argv)
 
     const uint8_t* p = (const uint8_t*)raw + 28;
     size_t remain = raw_size - 28;
-    for (uint32_t f = 0; f < N; f++) {
-        set_dump_frame((int)f);
-        int is_intra = (gop <= 0) ? (f == 0) : (f % gop == 0);
-        if (remain < 4) { fprintf(stderr, "truncated: frame %u length missing\n", f); return 1; }
+    size_t per = (size_t)3 * H * W;
+    uint32_t f = 0;
+    int chunk_reset = 1;
+    while (f < N && remain >= 4) {
         uint32_t len; memcpy(&len, p, 4); p += 4; remain -= 4;
-        if (remain < len) { fprintf(stderr, "truncated: frame %u stream missing\n", f); return 1; }
-        if (is_intra) {
+        if (remain < len) { fprintf(stderr, "truncated: stream at frame %u missing\n", f); return 1; }
+        int is_intra = (len > 0 && chunk_reset && f == 0);  /* first packet is intra */
+        if (f == 0) {
             st = dcvc_cpu_intra_pipeline_decode(intra, p, len, x_hat);
+            if (st) { fprintf(stderr, "decode intra failed: %s\n", dcvc_cpu_status_string(st)); return 1; }
+            memcpy(all, x_hat, per * sizeof(float));
+            memcpy(ref, x_hat, per * sizeof(float));
+            printf("frame %u (I): %u bytes\n", f, len);
+            f++; chunk_reset = 1;
         } else {
-            st = dcvc_cpu_inter_pipeline_decode(inter, p, len, ref, x_hat);
+            float* xhat_c = (float*)malloc(DCVC_FRAME_DELAY * per * sizeof(float));
+            st = dcvc_cpu_inter_pipeline_decode(inter, p, len, chunk_reset,
+                                                 chunk_reset ? ref : NULL, xhat_c);
+            if (st) { fprintf(stderr, "decode chunk@%u failed: %s\n", f, dcvc_cpu_status_string(st)); free(xhat_c); return 1; }
+            for (int j = 0; j < DCVC_FRAME_DELAY && f < N; j++, f++)
+                memcpy(all + (size_t)f * per, xhat_c + (size_t)j * per, per * sizeof(float));
+            printf("chunk@%u (P x%d): %u bytes\n", f, DCVC_FRAME_DELAY, len);
+            free(xhat_c);
+            chunk_reset = 0;
         }
-        if (st) { fprintf(stderr, "decode frame %u failed: %s\n", f, dcvc_cpu_status_string(st)); return 1; }
-        memcpy(all + (size_t)f * 3 * H * W, x_hat, 3 * H * W * sizeof(float));
-        memcpy(ref, x_hat, 3 * H * W * sizeof(float));
         p += len; remain -= len;
-        printf("frame %u (%s): %u bytes\n", f, is_intra ? "I" : "P", len);
+        (void)is_intra;
     }
     free(raw);
     dcvc_cpu_intra_pipeline_destroy(intra);

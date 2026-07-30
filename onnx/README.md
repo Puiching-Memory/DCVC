@@ -1,12 +1,29 @@
-# DCVC CPU ONNX codec (cross-platform, TensorRT-free I-frame + P-frame codec)
+# DCVC CPU ONNX codec (cross-platform, TensorRT-free I-frame + P-chunk codec)
 
-A standalone, **Linux + Windows** end-to-end DCVC-RT I-frame + P-frame
+A standalone, **Linux + Windows** end-to-end **DCVC-UF** I-frame + P-chunk
 (intra + inter) codec. CPU by default, with optional CUDA/TensorRT acceleration.
-Every neural subnet is exported from PyTorch as standard ONNX operators (no
-custom CUDA ops) and runs under **ONNX Runtime** (CPU execution provider by
-default; the CUDA or TensorRT EP can be enabled at runtime, see "GPU execution"
-below). Entropy coding uses the same C rANS library as the native runtime, so the
-pipeline is fully independent of TensorRT.
+The **intra** codec encodes a single frame; the **inter** codec encodes a *chunk*
+of `g_frame_delay` (8) frames into one latent (the DCVC-UF **HT-S / HT-L**
+chunk-based framework). Every neural subnet is exported from PyTorch as standard
+ONNX operators (no custom CUDA ops) and runs under **ONNX Runtime** (CPU
+execution provider by default; the CUDA or TensorRT EP can be enabled at runtime,
+see "GPU execution" below). Entropy coding uses the same C rANS library as the
+native runtime, so the pipeline is fully independent of TensorRT.
+
+> **Migration status.** The codec was ported from DCVC-RT (sequential P-frames)
+> to DCVC-UF **HT** (chunk-based). Both HT variants (**HT-S** means-only and
+> to DCVC-UF **HT** (chunk-based). Both HT variants (**HT-S** means-only and
+> **HT-L** scales+means spatial prior) are implemented end-to-end and
+> **numerically validated against the PyTorch reference** with the real
+> `cvpr2026` checkpoints:
+> - **intra (I-frame)** vs PyTorch `DMCI.forward_one_frame`: bit-exact parity,
+>   PSNR ≈ 116–118 dB (max_abs ~1e-5) at 192×192, 320×192, 128×256.
+> - **inter HT-S / HT-L (P-chunk)** vs PyTorch `DMC.forward_one_frame`: parity
+>   PSNR ≈ 127–129 dB (max_abs ~2–4e-6) at 256×256.
+> - closed-loop encode→decode: bit-exact (`maxdiff = 0`) for both variants.
+>
+> All three `cvpr2026` checkpoints (`image`, `video_hts`, `video_htl`) are
+> present and load with 0 missing / 0 unexpected keys.
 
 ## Directory layout
 
@@ -222,36 +239,47 @@ they return immediately and never block automation.
 - This logic (`onnx/tests/console_pause.h`) is a no-op on Linux/macOS.
 
 
-## I-frame + P-frame (inter-frame prediction)
+## I-frame + P-chunk (inter prediction)
 
 Frame 0 of a sequence is encoded as an **I-frame** by the intra image model
-(`DMCI`, `intra_*` models). Frames 1..N-1 are encoded as **P-frames** by the
-video model (`DMC`, `inter_*` models), each predicting from the *previous
-reconstructed frame* (closed-loop, so encoder and decoder references stay
-bit-exact — verified across Linux and Windows exactly like the intra codec).
+(`DMCI`, `intra_*` models). Subsequent frames are encoded in **chunks** of
+`g_frame_delay` (8) by the DCVC-UF **HT-S/HT-L** video model (`DMC`,
+`inter_*` models): a whole chunk shares one latent `y`, reconstructed in
+parallel by a frame-wise recon head. The feature-memory DPB (owned by the
+pipeline) propagates context across chunks: the first P-chunk references the
+intra reconstruction via `feature_adaptor_i`; later chunks use
+`feature_adaptor_m(memory, prev_decoder_feature)`.
 
 Pipeline (`src/cpu_inter_pipeline.c`):
 
 ```
-feature_adaptor_i(pixel_unshuffle(x_hat_prev))      # ref frame -> feature
-  -> feature_extractor(feature, q_feature)           # ctx, ctx_t
-  -> inter_encoder(pixel_unshuffle(x), ctx, q_enc)   # y latent
-  -> hyper_encoder(y) -> z (int8)                    # z bit-estimator (rANS)
-  -> [hyper_decoder(z) , temporal_prior(ctx_t)]      # hierarchical + temporal
-  -> prior_fusion -> params
-  -> 2x checkerboard AR prior (2 rANS passes)         # y symbols
-  -> inter_decoder(y_hat, ctx, q_dec)                 # feature
-  -> recon_generation(feature, q_recon)               # pixel_shuffle_8 -> x_hat
+feature_adaptor_i(pixel_unshuffle(x_hat_intra))      # first chunk: ref -> memory
+  / feature_adaptor_m(memory, prev_decoder_feature)  # later chunks
+  -> feature_extractor(memory)                        # ctx
+  -> inter_encoder(x_chunk, ctx, q_enc)               # y latent (8 frames -> 1 y)
+  -> hyper_encoder(y) -> z (int8)                     # z bit-estimator (rANS)
+  -> [hyper_decoder(z) , temporal_prior(memory,q)]    # hierarchical + temporal
+  -> prior_fusion -> params (768)
+  -> 4x checkerboard AR prior (4 rANS passes, HT-S)   # y symbols
+  -> inter_decoder(y_hat, ctx, q_dec)                 # shared feature
+  -> recon_head(feature)                              # 8 x pixel_shuffle_8 -> x_hat
 ```
 
-Run a closed-loop I+P sequence (frame 0 intra, the rest inter):
+Run a closed-loop I+P-chunk sequence (frame 0 intra, then one 8-frame chunk):
 
 ```bash
-./test_cpu_inter 5 256 256 32 32      # N H W qp_i qp_p  (H,W multiples of 64)
+./test_cpu_inter 2 256 256 32 32      # H W qp_i qp_p  (H,W multiples of 64)
+# select variant + model pack (export inter at the SAME resolution):
+DCVC_IS_HTS=1 ./test_cpu_inter --model-dir <hts_pack> 2 256 256 32 32   # HT-S
+DCVC_IS_HTS=0 ./test_cpu_inter --model-dir <htl_pack> 2 256 256 32 32   # HT-L
 ```
 
-On real video this gives a large rate saving vs coding every frame as I-frame
-(e.g. ~73% fewer bytes at equal/higher PSNR over a 24-frame window).
+> The inter (P-chunk) pipeline requires the HT-S or HT-L ONNX models, generated
+> from `cvpr2026_video_hts.pth.tar` / `cvpr2026_video_htl.pth.tar` via
+> `python/export_inter_models.py --model-structure hts|htl --height H --width W`.
+> `DCVC_IS_HTS` (1 = HT-S default, 0 = HT-L) selects the variant at runtime;
+> add `--random-weights` to export graph-only models for closed-loop testing
+> before the checkpoints arrive.
 
 ## Dynamic resolution
 
@@ -261,15 +289,19 @@ sizes with `invalid_arg`. The networks operate on the frame at 1/8 (feature),
 are built on the 1/16 plane, so the frame size must divide evenly by 64.
 
 Within that constraint the resolution is still dynamic: all exported models
-use dynamo `dynamic_shapes`, so a single model pack handles any multiple-of-64
-`H,W` (e.g. 64x64, 512x512, 1280x768, 1920x1088). For a fixed target
-resolution, `export_all_models.py` / `export_inter_models.py` accept
-`--height/--width` to bake every dim to static sizes (the picture size is
-rounded up to a multiple of 64 for the network input, e.g. 720p -> 1280x768,
-1080p -> 1920x1088).
-
-Verified bit-exact round-trips include 64x64, 192x256, 320x192, 512x512,
-1280x768 and 1920x1088 for I-frames, and 128x128 ... 512x512 for P-frames.
+> The **intra (I-frame)** pack is fully dynamic: every subnet is single-input,
+> so one export handles any multiple-of-64 `H,W` (e.g. 64x64 ... 1920x1088),
+> verified bit-exact at 64x64, 192x256, 320x192, 512x512, 1280x768, 1920x1088.
+>
+> The **inter (HT P-chunk)** pack must be exported at the target resolution
+> (`--height/--width`). Its multi-input subnets (encoder, decoder,
+> feature_adaptor_m) feed two planes at different resolutions (frame vs 1/8 vs
+> 1/16), and torch 2.13 cannot express the `H//8` derived-dim relationship, so
+> only the first spatial input is symbolic and the rest are baked. The other
+> inter subnets (incl. the spatial-prior adaptor and prior-fusion, exported as
+> single pre-catted inputs) are dynamic. Export per target resolution; the
+> picture size is rounded up to a multiple of 64 for the network input
+> (e.g. 720p -> 1280x768, 1080p -> 1920x1088).
 
 ## Run the tests
 
@@ -294,7 +326,7 @@ cd onnx
 uv run python python/export_all_models.py
 # Custom locations (defaults are relative to the repo root, never hardcoded):
 #   --out-dir <dir>          default: <repo>/onnx/models
-#   --checkpoint <pth>       default: <repo>/checkpoints/cvpr2025_image.pth.tar
+#   --checkpoint <pth>       default: <repo>/checkpoints/cvpr2026_image.pth.tar
 ```
 
 This dynamo-exports all 9 intra nets from `DMCI` (including
@@ -310,16 +342,16 @@ testing is done against. The original FP32 entropy nets are kept in
 `onnx/models_fp32/` for RD comparison only — they can desync across MSVC/GCC on
 real video (see `docs/entropy_sync_ptq_report.md`).
 
-| File | Purpose |
-|------|---------|
-| `intra_analysis_standard.onnx` | image → latent `y` |
-| `intra_hyper_enc.onnx` / `hyper_dec.onnx` | hyper-encoder / decoder |
-| `y_prior_fusion.onnx` | fused prior parameters |
-| `y_spatial_prior*.onnx` (+ `reduction`, `adaptor_1..3`) | AR spatial prior nets |
-| `intra_synthesis.onnx` | latent → reconstruction |
-| `gaussian_*.npy` | y rANS CDF tables |
-| `bitest_*.npy` | z rANS CDF tables |
-| `q_scale_enc.npy` / `q_scale_dec.npy` | per-QP quantization scales |
+| File                                                    | Purpose                    |
+| ------------------------------------------------------- | -------------------------- |
+| `intra_analysis_standard.onnx`                          | image → latent `y`         |
+| `intra_hyper_enc.onnx` / `hyper_dec.onnx`               | hyper-encoder / decoder    |
+| `y_prior_fusion.onnx`                                   | fused prior parameters     |
+| `y_spatial_prior*.onnx` (+ `reduction`, `adaptor_1..3`) | AR spatial prior nets      |
+| `intra_synthesis.onnx`                                  | latent → reconstruction    |
+| `gaussian_*.npy`                                        | y rANS CDF tables          |
+| `bitest_*.npy`                                          | z rANS CDF tables          |
+| `q_scale_enc.npy` / `q_scale_dec.npy`                   | per-QP quantization scales |
 
 ## Cross-platform interoperability test
 
@@ -370,10 +402,10 @@ bitstream -- so byte-identical output implies the prior itself is bit-identical.
 Measured directly (GCC-built Linux ORT vs MSVC-built Windows ORT, same models,
 ~197k floats dumped from both `y` and `params_fusion`):
 
-| tensor | elements | byte-identical | max abs diff |
-|--------|----------|----------------|--------------|
-| `y` (analysis out) | 65,536 | yes | 0.000e+00 |
-| `params_fusion` (prior) | 131,584 | yes | 0.000e+00 |
+| tensor                  | elements | byte-identical | max abs diff |
+| ----------------------- | -------- | -------------- | ------------ |
+| `y` (analysis out)      | 65,536   | yes            | 0.000e+00    |
+| `params_fusion` (prior) | 131,584  | yes            | 0.000e+00    |
 
 i.e. the actual cross-ORT difference is **0**, ~1,000,000x under the 1e-6
 divergence threshold, so there is nothing to amplify. The ONNX Runtime CPU EP

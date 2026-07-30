@@ -280,6 +280,24 @@ DcvcCpuEngine* dcvc_cpu_engine_create(const char* onnx_path, int use_gpu, DcvcCp
     check_status(api, st, out_st);
     if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
 
+    /* Low-memory mode: shrink ORT's per-session arena footprint.
+     * - kSameAsRequested: allocate exactly what each op needs instead of
+     *   rounding up to the next power of two (saves ~40-60% workspace).
+     * - Disable memory pattern: ORT normally records the first run's
+     *   allocation sizes and pre-allocates for subsequent runs; disabling
+     *   this avoids the extra shadow buffer at the cost of minor overhead. */
+    {
+        /* DCVC_LOW_MEMORY: disable ORT's memory-pattern shadow buffer (stock ORT
+         * 1.27 no longer exposes the custom SetDefaultCpuMemArena /
+         * SetArenaExtendStrategy setters, so only the pattern toggle remains). */
+        const char* lm = getenv("DCVC_LOW_MEMORY");
+        if (lm && lm[0] == '1') {
+            st = api->EnableMemPattern(eng->opts);
+            check_status(api, st, out_st);
+            if (st) { dcvc_cpu_engine_destroy(eng); return nullptr; }
+        }
+    }
+
     int ep = dcvc_requested_ep(use_gpu);
     if (ep != 0) dcvc_log_ep_once(ep, dcvc_try_append_gpu_ep(api, eng->opts, ep));
 

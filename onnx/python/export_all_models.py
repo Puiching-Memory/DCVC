@@ -20,10 +20,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# The top-level src/ is the CVPR-2026 (384-ch) code; the shipped models were
-# built from DCVC-family/DCVC-RT (368-ch, cvpr2025 checkpoints). --src-root
-# selects which tree provides the src/ package for this export. It is
-# pre-parsed here because the src.* imports below happen at module load time.
+# The top-level src/ is the DCVC-UF (CVPR-2026, 384-ch) code and is the
+# default. --src-root selects which tree provides the src/ package for this
+# export. It is pre-parsed here because the src.* imports below happen at
+# module load time.
 SRC_ROOT = ROOT
 for _i, _a in enumerate(sys.argv):
     if _a == '--src-root' and _i + 1 < len(sys.argv):
@@ -44,12 +44,11 @@ utils = types.ModuleType('utils')
 utils.__path__ = [os.path.join(SRC_ROOT, 'src', 'utils')]
 sys.modules['src.utils'] = utils
 
-from src.models.image_model import DMCI, g_ch_enc_dec
+from src.models.image_model import DMCI, g_ch_enc_dec, g_ch_y, g_ch_z
+from src.utils.common import get_state_dict
 import torch
 import numpy as np
 
-N = 256
-ZC = 128
 
 # Latest opset officially supported by the deployed ONNX Runtime 1.27
 # (opset 27 is still "under development" and rejected by ORT at load time).
@@ -94,11 +93,10 @@ def export_torch(net, args, path, in_names, out_name, fixed_size=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out-dir', default=os.path.join(ROOT, 'onnx', 'models'))
-    parser.add_argument('--checkpoint', default=os.path.join(ROOT, 'checkpoints', 'cvpr2025_image.pth.tar'))
+    parser.add_argument('--checkpoint', default=os.path.join(ROOT, 'checkpoints', 'cvpr2026_image.pth.tar'))
     parser.add_argument('--src-root', default=SRC_ROOT,
                         help='tree providing the src/ package to export from '
-                             '(default: repo top-level; use DCVC-family/DCVC-RT '
-                             'for the shipped cvpr2025 models)')
+                             '(default: repo top-level = DCVC-UF)')
     parser.add_argument('--height', type=int, default=None,
                         help='fixed picture height (padded up to a multiple of 64); '
                              'omit for dynamic H/W')
@@ -114,11 +112,7 @@ def main():
 
     # Load checkpoint
     model = DMCI()
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    sd = ckpt['state_dict']
-    if all(k.startswith('module.') for k in sd.keys()):
-        sd = {k[7:]: v for k, v in sd.items()}
-    model.load_state_dict(sd)
+    model.load_state_dict(get_state_dict(args.checkpoint))
     model.eval()
 
     # All 9 intra nets: dynamo export from DMCI submodules (DepthConvBlock torch path).
@@ -136,33 +130,36 @@ def main():
     export_torch(model.enc, (torch.randn(1, 3, H, W), torch.ones(1, g_ch_enc_dec, 1, 1)),
                  os.path.join(out_dir, 'intra_analysis_standard.onnx'), ['in0', 'in1'], 'out0',
                  fixed_size=fixed_size)
-    export_torch(model.hyper_enc, torch.randn(1, N, H // 16, W // 16),
+    export_torch(model.hyper_enc, torch.randn(1, g_ch_y, H // 16, W // 16),
                  os.path.join(out_dir, 'intra_hyper_enc.onnx'), ['in0'], 'out0',
                  fixed_size=fixed_size)
-    export_torch(model.hyper_dec, torch.randn(1, ZC, H // 64, W // 64),
+    export_torch(model.hyper_dec, torch.randn(1, g_ch_z, H // 64, W // 64),
                  os.path.join(out_dir, 'hyper_dec.onnx'), ['in0'], 'out0',
                  fixed_size=fixed_size)
-    export_torch(model.y_prior_fusion, torch.randn(1, N, H // 16, W // 16),
+    export_torch(model.y_prior_fusion, torch.randn(1, g_ch_y, H // 16, W // 16),
                  os.path.join(out_dir, 'y_prior_fusion.onnx'), ['in0'], 'out0',
                  fixed_size=fixed_size)
-    export_torch(model.y_spatial_prior_reduction, torch.randn(1, 2 * N + 2, H // 16, W // 16),
+    export_torch(model.y_spatial_prior_reduction, torch.randn(1, g_ch_y * 2, H // 16, W // 16),
                  os.path.join(out_dir, 'y_spatial_prior_reduction.onnx'), ['in0'], 'out0',
                  fixed_size=fixed_size)
     for i in [1, 2, 3]:
-        export_torch(getattr(model, f'y_spatial_prior_adaptor_{i}'), torch.randn(1, 2 * N, H // 16, W // 16),
+        export_torch(getattr(model, f'y_spatial_prior_adaptor_{i}'), torch.randn(1, g_ch_y * 2, H // 16, W // 16),
                      os.path.join(out_dir, f'y_spatial_prior_adaptor_{i}.onnx'), ['in0'], 'out0',
                      fixed_size=fixed_size)
-    export_torch(model.y_spatial_prior, torch.randn(1, 2 * N, H // 16, W // 16),
+    export_torch(model.y_spatial_prior, torch.randn(1, g_ch_y * 2, H // 16, W // 16),
                  os.path.join(out_dir, 'y_spatial_prior.onnx'), ['in0'], 'out0',
                  fixed_size=fixed_size)
-    export_torch(model.dec, (torch.randn(1, N, H // 16, W // 16), torch.ones(1, g_ch_enc_dec, 1, 1)),
+    export_torch(model.dec, (torch.randn(1, g_ch_y, H // 16, W // 16), torch.ones(1, g_ch_enc_dec, 1, 1)),
                  os.path.join(out_dir, 'intra_synthesis.onnx'), ['in0', 'in1'], 'out0',
                  fixed_size=fixed_size)
 
-    # QP scales
+    # QP scales (encoder/synthesis use g_ch_enc_dec channels; the 4x prior
+    # quantization steps for y use the per-channel q_scale_y_enc/dec banks).
     np.save(os.path.join(out_dir, 'q_scale_enc.npy'), model.q_scale_enc.detach().cpu().numpy())
     np.save(os.path.join(out_dir, 'q_scale_dec.npy'), model.q_scale_dec.detach().cpu().numpy())
-    print('saved q_scale_enc.npy / q_scale_dec.npy')
+    np.save(os.path.join(out_dir, 'q_scale_y_enc.npy'), model.q_scale_y_enc.detach().cpu().numpy())
+    np.save(os.path.join(out_dir, 'q_scale_y_dec.npy'), model.q_scale_y_dec.detach().cpu().numpy())
+    print('saved q_scale_enc/dec + q_scale_y_enc/dec .npy')
 
     # CDF tables from tensorRT assets
     cdf_src = os.path.join(ROOT, 'tensorRT', 'assets', 'decode')

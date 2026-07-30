@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define DCVC_FRAME_DELAY 8  /* DCVC-UF HT: frames per inter (P-chunk) packet */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -85,6 +87,16 @@ DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_exec_provider(dcvc_config_t* cf
 /* When nonzero, append a CRC-32 integrity tag to every emitted packet and
  * verify it on decode (default: on). Cheap insurance against channel flips. */
 DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_crc(dcvc_config_t* cfg, int enable);
+
+/* Low-memory mode (default: off). When enabled the library:
+ *   1. Configures ORT with kSameAsRequested arena strategy and disables
+ *      memory patterns, reducing per-session workspace by ~40-60%.
+ *   2. Defers inter (P-frame) pipeline creation until the first inter frame
+ *      is actually encoded/decoded, saving ~2 GB when only I-frames are used.
+ *   3. Caps intra-op threads to min(threads, 2) unless explicitly overridden.
+ * Trade-off: slightly higher per-frame latency on first P-frame (one-time
+ * model load) and marginally slower steady-state inference. */
+DCVC_API dcvc_status_t DCVC_CALL dcvc_config_set_low_memory(dcvc_config_t* cfg, int enable);
 
 #ifdef __cplusplus
 }

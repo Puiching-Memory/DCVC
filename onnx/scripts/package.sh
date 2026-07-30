@@ -232,9 +232,10 @@ if [[ "${TARGET}" == "mingw" ]]; then
     # Windows: dcvc.dll lands in bin/ (runtime artifact), so co-locate the
     # ORT DLLs there too -- the demo loads all DLLs from its own directory.
     cp -f "${ORT_LIB_SRC}"/onnxruntime.dll "${STAGE_BIN}/" 2>/dev/null || true
-    cp -f "${ORT_LIB_SRC}"/onnxruntime_providers_shared.dll "${STAGE_BIN}/" 2>/dev/null || true
+    cp -f "${ORT_LIB_SRC}"/onnxruntime_providers_*.dll "${STAGE_BIN}/" 2>/dev/null || true
 else
     cp -f "${ORT_LIB_SRC}"/libonnxruntime.so.* "${STAGE_LIB}/" 2>/dev/null || true
+    cp -f "${ORT_LIB_SRC}"/libonnxruntime_providers_*.so "${STAGE_LIB}/" 2>/dev/null || true
 fi
 
 # Example source + quickstart docs.
@@ -318,6 +319,11 @@ else
     for f in include/dcvc/dcvc.h lib/libdcvc.so.1 lib/cmake/dcvc/dcvcTargets.cmake bin/dcvc_demo; do
         [[ -e "${STAGING}/${f}" ]] || { echo "  MISSING: ${f}"; MISSING=1; }
     done
+    if [[ -n "${DCVC_ORT_GPU:-}" ]]; then
+        for f in lib/libonnxruntime_providers_shared.so lib/libonnxruntime_providers_cuda.so; do
+            [[ -f "${STAGING}/${f}" ]] || { echo "  MISSING: ${f}"; MISSING=1; }
+        done
+    fi
 fi
 if [[ "${NO_MODELS}" -eq 0 ]]; then
     for model_name in "${MODEL_PACK_NAMES[@]}"; do

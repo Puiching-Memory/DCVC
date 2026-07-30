@@ -20,8 +20,6 @@ typedef struct {
     int n_ch;
     int r_ch;     /* n_ch / 4 */
     int p_ch;     /* 2*n_ch + 2 */
-    float* qenc;     /* HW */
-    float* qdec;     /* HW */
     float* scales;   /* n_ch*HW */
     float* means;    /* n_ch*HW */
     float* common;   /* n_ch*HW */
@@ -66,7 +64,7 @@ static const int k_mask_pattern[4][4] = {
 static void ws_free(ArWorkspace* ws)
 {
     if (!ws->hw) return;
-    free(ws->qenc); free(ws->qdec); free(ws->scales); free(ws->means);
+    free(ws->scales); free(ws->means);
     free(ws->common); free(ws->smask); free(ws->sr); free(ws->yq_full); free(ws->yq); free(ws->yq_w);
     free(ws->packed); free(ws->indexes); free(ws->yhat_step); free(ws->cat);
     free(ws->sp_out); free(ws->yhat); free(ws->syms_i8);
@@ -82,12 +80,10 @@ static DcvcCpuStatus ws_ensure(DcvcCpuArCodec* c, int H, int W)
 
     int nc = c->n_ch;
     int r = nc / 4;
-    int pch = 2 * nc + 2;
+    int pch = 2 * nc;
     ArWorkspace* ws = &c->ws;
     ws->hw = hw; ws->n_ch = nc; ws->r_ch = r; ws->p_ch = pch;
 
-    ws->qenc = (float*)malloc(hw * sizeof(float));
-    ws->qdec = (float*)malloc(hw * sizeof(float));
     ws->scales = (float*)malloc(nc * hw * sizeof(float));
     ws->means = (float*)malloc(nc * hw * sizeof(float));
     ws->common = (float*)malloc(nc * hw * sizeof(float));
@@ -104,7 +100,7 @@ static DcvcCpuStatus ws_ensure(DcvcCpuArCodec* c, int H, int W)
     ws->yhat = (float*)malloc(nc * hw * sizeof(float));
     ws->syms_i8 = (int8_t*)malloc(r * hw);
 
-    float** ptrs[] = {&ws->qenc, &ws->qdec, &ws->scales, &ws->means, &ws->common,
+    float** ptrs[] = {&ws->scales, &ws->means, &ws->common,
                       &ws->smask, &ws->sr, &ws->yq_full, &ws->yq, &ws->yq_w, (float**)&ws->packed,
                       (float**)&ws->indexes, &ws->yhat_step, &ws->cat, &ws->sp_out,
                       &ws->yhat, (float**)&ws->syms_i8};
@@ -134,24 +130,25 @@ static DcvcCpuStatus ws_ensure(DcvcCpuArCodec* c, int H, int W)
 
 static float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-static void separate_prior_intra(const float* pf, float* qenc, float* qdec,
-                                 float* scales, float* means, int nc, int hw)
+/* DCVC-UF: params_fusion is 2*nc (scales + means); the y quant steps are
+ * supplied by the caller (q_enc/q_dec). */
+static void separate_prior_image(const float* pf, float* scales, float* means,
+                                 int nc, int hw)
 {
-    for (int i = 0; i < hw; i++) {
-        qenc[i] = sigmoid(pf[i]) * 1.5f + 0.5f;
-        qdec[i] = sigmoid(pf[hw + i]) * 1.5f + 0.5f;
-    }
-    for (int i = 0; i < nc * hw; i++) {
-        scales[i] = pf[2 * hw + i];
-        means[i] = pf[(2 + nc) * hw + i];
-    }
+    (void)hw;
+    memcpy(scales, pf, (size_t)nc * hw * sizeof(float));
+    memcpy(means, pf + (size_t)nc * hw, (size_t)nc * hw * sizeof(float));
 }
 
 static void broadcast_mul(const float* in, const float* q, float* out, int nc, int hw)
 {
+    /* q is per-channel [nc] (qyenc/qydec, g_ch_y floats), broadcast across the
+     * spatial plane of each channel — NOT a per-spatial-position vector. The old
+     * `q[i]` indexing happened to coincide with `q[ch]` only at the degenerate
+     * 256x256 (hw==nc) export resolution, masking the bug at any other size. */
     for (int ch = 0; ch < nc; ch++)
         for (int i = 0; i < hw; i++)
-            out[ch * hw + i] = in[ch * hw + i] * q[i];
+            out[ch * hw + i] = in[ch * hw + i] * q[ch];
 }
 
 static void sp4x(const float* x, float* out, int n)
@@ -314,11 +311,12 @@ void dcvc_cpu_ar_codec_destroy(DcvcCpuArCodec* c)
 
 DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
                                           const float* y, const float* params_fusion,
+                                          const float* q_enc, const float* q_dec,
                                           int H, int W,
                                           uint8_t** out_stream, size_t* out_size,
                                           float* y_hat_out)
 {
-    if (!c || !y || !params_fusion || !out_stream || !out_size)
+    if (!c || !y || !params_fusion || !q_enc || !q_dec || !out_stream || !out_size)
         return DCVC_CPU_ERR_INVALID_ARG;
     *out_stream = NULL; *out_size = 0;
 
@@ -328,13 +326,13 @@ DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
     int nc = c->n_ch, hw = H * W, r = nc / 4;
     ArWorkspace* ws = &c->ws;
 
-    separate_prior_intra(params_fusion, ws->qenc, ws->qdec, ws->scales, ws->means, nc, hw);
+    separate_prior_image(params_fusion, ws->scales, ws->means, nc, hw);
 
-    st = run_engine(c->eng_reduction, params_fusion, 1, 2 * nc + 2, H, W,
+    st = run_engine(c->eng_reduction, params_fusion, 1, 2 * nc, H, W,
                     ws->common, 1, nc, H, W);
     if (st != DCVC_CPU_OK) return st;
 
-    broadcast_mul(y, ws->qenc, ws->yq_full, nc, hw);
+    broadcast_mul(y, q_enc, ws->yq_full, nc, hw);
 
     dcvc_rans_encoder_reset(c->rans_enc);
     c->g_cdf_idx = dcvc_rans_encoder_add_cdf(c->rans_enc, dcvc_npy_i32(&c->gcdf),
@@ -370,7 +368,7 @@ DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
         add_inplace(ws->yhat, ws->yhat_step, nc * hw);
     }
 
-    broadcast_mul(ws->yhat, ws->qdec, ws->yhat, nc, hw);
+    broadcast_mul(ws->yhat, q_dec, ws->yhat, nc, hw);
 
     if (y_hat_out)
         memcpy(y_hat_out, ws->yhat, nc * hw * sizeof(float));
@@ -382,11 +380,12 @@ DcvcCpuStatus dcvc_cpu_ar_codec_encode_y(DcvcCpuArCodec* c,
 
 DcvcCpuStatus dcvc_cpu_ar_codec_decode_y(DcvcCpuArCodec* c,
                                           const float* params_fusion,
+                                          const float* q_enc, const float* q_dec,
                                           int H, int W,
                                           const uint8_t* stream, size_t stream_size,
                                           float* y_hat_out)
 {
-    if (!c || !params_fusion || !stream || !y_hat_out)
+    if (!c || !params_fusion || !q_enc || !q_dec || !stream || !y_hat_out)
         return DCVC_CPU_ERR_INVALID_ARG;
 
     DcvcCpuStatus st = ws_ensure(c, H, W);
@@ -395,9 +394,9 @@ DcvcCpuStatus dcvc_cpu_ar_codec_decode_y(DcvcCpuArCodec* c,
     int nc = c->n_ch, hw = H * W, r = nc / 4;
     ArWorkspace* ws = &c->ws;
 
-    separate_prior_intra(params_fusion, ws->qenc, ws->qdec, ws->scales, ws->means, nc, hw);
+    separate_prior_image(params_fusion, ws->scales, ws->means, nc, hw);
 
-    st = run_engine(c->eng_reduction, params_fusion, 1, 2 * nc + 2, H, W,
+    st = run_engine(c->eng_reduction, params_fusion, 1, 2 * nc, H, W,
                     ws->common, 1, nc, H, W);
     if (st != DCVC_CPU_OK) return st;
 
@@ -449,7 +448,7 @@ DcvcCpuStatus dcvc_cpu_ar_codec_decode_y(DcvcCpuArCodec* c,
     if (dcvc_rans_decoder_bytes_consumed(c->rans_dec) != stream_size)
         return DCVC_CPU_ERR_ENTROPY;
 
-    broadcast_mul(ws->yhat, ws->qdec, ws->yhat, nc, hw);
+    broadcast_mul(ws->yhat, q_dec, ws->yhat, nc, hw);
     memcpy(y_hat_out, ws->yhat, nc * hw * sizeof(float));
     return DCVC_CPU_OK;
 }

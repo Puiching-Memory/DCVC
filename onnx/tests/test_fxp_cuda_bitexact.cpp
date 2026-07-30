@@ -128,6 +128,58 @@ static int test_dw(int c, int h, int w, unsigned seed)
     return ok ? 0 : 1;
 }
 
+static int test_general(int cin, int cout, int h, int w,
+                        int kh, int kw, int pad_t, int pad_l,
+                        int pad_b, int pad_r, int sh, int sw,
+                        int group, unsigned seed)
+{
+    const int oh = (h + pad_t + pad_b - kh) / sh + 1;
+    const int ow = (w + pad_l + pad_r - kw) / sw + 1;
+    const int cin_g = cin / group;
+    std::vector<float> x((size_t)cin * h * w);
+    std::vector<float> y_cpu((size_t)cout * oh * ow), y_gpu(y_cpu.size());
+    std::vector<int16_t> wt((size_t)cout * cin_g * kh * kw);
+    std::vector<float> ws(cout), b(cout);
+    fill_f(x.data(), (int)x.size(), seed);
+    fill_i16(wt.data(), (int)wt.size(), seed + 1);
+    for (int i = 0; i < cout; i++) {
+        ws[i] = 0.0001f * (1 + (i % 7));
+        b[i] = 0.001f * (float)i;
+    }
+    const float xs = 0.02f;
+    fxp_conv_f32(x.data(), y_cpu.data(), 1, cin, cout, h, w,
+                 wt.data(), ws.data(), b.data(), xs, kh, kw,
+                 pad_t, pad_l, pad_b, pad_r, sh, sw, group, 16);
+
+    float* dx = dev_copy(x.data(), x.size());
+    float* dy = nullptr;
+    int16_t* dw = dev_copy(wt.data(), wt.size());
+    float* dws = dev_copy(ws.data(), ws.size());
+    float* db = dev_copy(b.data(), b.size());
+    cudaMalloc(&dy, y_gpu.size() * sizeof(float));
+    int rc = fxp_conv_f32_cuda(dx, dy, 1, cin, cout, h, w,
+                               dw, dws, db, xs, kh, kw,
+                               pad_t, pad_l, pad_b, pad_r, sh, sw, group, nullptr);
+    cudaError_t sync_rc = cudaDeviceSynchronize();
+    if (sync_rc == cudaSuccess)
+        cudaMemcpy(y_gpu.data(), dy, y_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(dy); cudaFree(dw); cudaFree(dws); cudaFree(db);
+
+    int mism = 0;
+    if (rc == 0 && sync_rc == cudaSuccess) {
+        for (size_t i = 0; i < y_cpu.size(); i++)
+            if (y_cpu[i] != y_gpu[i]) mism++;
+    }
+    const int ok = rc == 0 && sync_rc == cudaSuccess && mism == 0;
+    printf("general %dx%d k=%dx%d pad=%d,%d,%d,%d stride=%dx%d group=%d: %s",
+           cin, cout, kh, kw, pad_t, pad_l, pad_b, pad_r, sh, sw, group,
+           ok ? "PASS" : "FAIL");
+    if (!ok) printf(" (rc=%d cuda=%s mism=%d/%zu)", rc,
+                    cudaGetErrorString(sync_rc), mism, y_cpu.size());
+    printf("\n");
+    return ok ? 0 : 1;
+}
+
 static int test_wsrelu(void)
 {
     const int n = 8192;
@@ -170,6 +222,10 @@ int main()
     fail |= test_1x1(1024, 512, 16, 16, 13);
     fail |= test_dw(64, 16, 16, 23);
     fail |= test_dw(512, 16, 16, 29);
+    fail |= test_general(8, 12, 9, 11, 3, 3, 1, 1, 1, 1, 1, 1, 1, 31);
+    fail |= test_general(16, 8, 10, 12, 3, 3, 1, 1, 1, 1, 2, 2, 1, 37);
+    fail |= test_general(8, 8, 8, 10, 2, 2, 0, 0, 0, 0, 2, 2, 1, 41);
+    fail |= test_general(8, 12, 7, 9, 3, 2, 2, 1, 0, 2, 2, 1, 2, 43);
     fail |= test_wsrelu();
     printf(fail ? "OVERALL FAIL\n" : "OVERALL PASS\n");
     return fail ? 1 : 0;

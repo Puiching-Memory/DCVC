@@ -46,8 +46,10 @@ struct DcvcCpuIntraPipeline {
     DcvcNpy zcdf, zlen, zoff;
     int z_cdf_idx;
 
-    float* qenc; /* 368 floats */
-    float* qdec; /* 368 floats */
+    float* qenc; /* g_ch_enc_dec (384) floats: analysis quant step */
+    float* qdec; /* g_ch_enc_dec (384) floats: synthesis quant step */
+    float* qyenc; /* g_ch_y (256) floats: 4x-prior y quant step (encode) */
+    float* qydec; /* g_ch_y (256) floats: 4x-prior y quant step (decode) */
 
     /* Workspace */
     float* y;            /* N * yH * yW */
@@ -56,7 +58,7 @@ struct DcvcCpuIntraPipeline {
     float* z_hat;        /* ZC * zH * zW */
     int8_t* z_int8;      /* ZC * zH * zW */
     float* params;       /* N * yH * yW */
-    float* params_fusion;/* (2N+2) * yH * yW */
+    float* params_fusion;/* (2N) * yH * yW (scales + means) */
     float* y_hat;        /* N * yH * yW */
     float* x_pad;        /* 3 * Hp * Wp (replicate-padded YCbCr input) */
     float* x_hat;        /* 3 * Hp * Wp (cropped RGB output) */
@@ -251,6 +253,22 @@ DcvcCpuIntraPipeline* dcvc_cpu_intra_pipeline_create(const char* model_dir,
     for (int i = 0; i < qd.dims[1]; i++) p->qdec[i] = dcvc_npy_f32(&qd)[qp * qd.dims[1] + i];
     dcvc_npy_free(&qd);
 
+    snprintf(path, sizeof(path), "%s/q_scale_y_enc.npy", model_dir);
+    DcvcNpy qye = {0};
+    if (dcvc_npy_read(path, &qye) != 0) { st = DCVC_CPU_ERR_IO; goto fail; }
+    p->qyenc = (float*)malloc(qye.dims[1] * sizeof(float));
+    if (!p->qyenc) { dcvc_npy_free(&qye); st = DCVC_CPU_ERR_OOM; goto fail; }
+    for (int i = 0; i < qye.dims[1]; i++) p->qyenc[i] = dcvc_npy_f32(&qye)[qp * qye.dims[1] + i];
+    dcvc_npy_free(&qye);
+
+    snprintf(path, sizeof(path), "%s/q_scale_y_dec.npy", model_dir);
+    DcvcNpy qyd = {0};
+    if (dcvc_npy_read(path, &qyd) != 0) { st = DCVC_CPU_ERR_IO; goto fail; }
+    p->qydec = (float*)malloc(qyd.dims[1] * sizeof(float));
+    if (!p->qydec) { dcvc_npy_free(&qyd); st = DCVC_CPU_ERR_OOM; goto fail; }
+    for (int i = 0; i < qyd.dims[1]; i++) p->qydec[i] = dcvc_npy_f32(&qyd)[qp * qyd.dims[1] + i];
+    dcvc_npy_free(&qyd);
+
     int yhw = p->yH * p->yW;
     int zhw = p->zH * p->zW;
     p->y = (float*)malloc(p->N * yhw * sizeof(float));
@@ -259,7 +277,7 @@ DcvcCpuIntraPipeline* dcvc_cpu_intra_pipeline_create(const char* model_dir,
     p->z_hat = (float*)malloc(p->ZC * zhw * sizeof(float));
     p->z_int8 = (int8_t*)malloc(p->ZC * zhw);
     p->params = (float*)malloc(p->N * yhw * sizeof(float));
-    p->params_fusion = (float*)malloc((2 * p->N + 2) * yhw * sizeof(float));
+    p->params_fusion = (float*)malloc((2 * p->N) * yhw * sizeof(float));
     p->y_hat = (float*)malloc(p->N * yhw * sizeof(float));
     p->x_pad = (float*)malloc(3 * p->Hp * p->Wp * sizeof(float));
     p->x_hat = (float*)malloc(3 * p->Hp * p->Wp * sizeof(float));
@@ -290,7 +308,7 @@ void dcvc_cpu_intra_pipeline_destroy(DcvcCpuIntraPipeline* p)
     if (p->rans_enc) dcvc_rans_encoder_destroy(p->rans_enc);
     if (p->rans_dec) dcvc_rans_decoder_destroy(p->rans_dec);
     dcvc_npy_free(&p->zcdf); dcvc_npy_free(&p->zlen); dcvc_npy_free(&p->zoff);
-    free(p->qenc); free(p->qdec);
+    free(p->qenc); free(p->qdec); free(p->qyenc); free(p->qydec);
     free(p->y); free(p->y_pad); free(p->z); free(p->z_hat); free(p->z_int8);
     free(p->params); free(p->params_fusion); free(p->y_hat); free(p->x_hat);
     free(p->x_pad); free(p->x_ycbcr);
@@ -312,23 +330,15 @@ DcvcCpuStatus dcvc_cpu_intra_pipeline_encode(DcvcCpuIntraPipeline* p,
     DcvcCpuStatus st;
 
     /* Step 1: replicate-pad x to a multiple of 64, convert RGB to YCbCr,
-     * then analysis: x_pad [1,3,Hp,Wp] + qenc [1,368,1,1] -> y [1,256,yH,yW].
+     * then analysis: x_pad [1,3,Hp,Wp] + qenc [1,384,1,1] -> y [1,256,yH,yW].
      * The public API now always accepts RGB and performs the color conversion
      * internally, matching the PyTorch test_video.py path. */
     replicate_pad_3(x, H, W, p->x_pad, Hp, Wp);
     rgb_to_ycbcr(p->x_pad, p->x_ycbcr, Hp * Wp);
     st = run_engine2(p->eng_analysis, p->x_ycbcr, 1, 3, Hp, Wp,
-                     p->qenc, 1, 368, 1, 1,
+                     p->qenc, 1, 384, 1, 1,
                      p->y, 1, p->N, p->yH, p->yW);
     if (st != DCVC_CPU_OK) return st;
-
-    /* Clamp y to [-128, 127] to match PyTorch path */
-    for (int i = 0; i < p->N * yhw; i++) {
-        float v = p->y[i];
-        if (v > 127.0f) v = 127.0f;
-        if (v < -128.0f) v = -128.0f;
-        p->y[i] = v;
-    }
 
     dcvc_debug_dump("DCVC_DUMP_Y", p->y, p->N, p->yH, p->yW);
 
@@ -360,16 +370,18 @@ DcvcCpuStatus dcvc_cpu_intra_pipeline_encode(DcvcCpuIntraPipeline* p,
 
     /* Step 6: y_prior_fusion: params -> params_fusion */
     st = run_engine(p->eng_prior_fusion, p->params, 1, p->N, p->yH, p->yW,
-                    p->params_fusion, 1, 2 * p->N + 2, p->yH, p->yW);
+                    p->params_fusion, 1, 2 * p->N, p->yH, p->yW);
     if (st != DCVC_CPU_OK) { free(z_stream); return st; }
 
-    dcvc_debug_dump("DCVC_DUMP_PARAMS", p->params_fusion, 2 * p->N + 2, p->yH, p->yW);
+    dcvc_debug_dump("DCVC_DUMP_PARAMS", p->params_fusion, 2 * p->N, p->yH, p->yW);
 
     /* Step 7: AR codec encode */
     uint8_t* y_stream = NULL; size_t y_stream_size = 0;
     st = dcvc_cpu_ar_codec_encode_y(p->ar_codec, p->y, p->params_fusion,
-                                     p->yH, p->yW, &y_stream, &y_stream_size, p->y_hat);
+                                     p->qyenc, p->qydec,
+                                    p->yH, p->yW, &y_stream, &y_stream_size, p->y_hat);
     if (st != DCVC_CPU_OK) { free(z_stream); return st; }
+    dcvc_debug_dump("DCVC_DUMP_YHAT", p->y_hat, p->N, p->yH, p->yW);
 
     /* Step 8: Mux [z_len:u32][z_stream][y_stream] */
     size_t total = 4 + z_stream_size + y_stream_size;
@@ -386,8 +398,8 @@ DcvcCpuStatus dcvc_cpu_intra_pipeline_encode(DcvcCpuIntraPipeline* p,
     /* Step 9: optional synthesis, then YCbCr -> RGB conversion on output */
     if (x_hat_out) {
         st = run_engine2(p->eng_synthesis, p->y_hat, 1, p->N, p->yH, p->yW,
-                         p->qdec, 1, 368, 1, 1,
-                         p->x_ycbcr, 1, 3, Hp, Wp);
+                         p->qdec, 1, 384, 1, 1,
+                        p->x_ycbcr, 1, 3, Hp, Wp);
         if (st != DCVC_CPU_OK) return st;
         ycbcr_to_rgb(p->x_ycbcr, p->x_hat, Hp * Wp);
         crop_3(p->x_hat, Hp, Wp, x_hat_out, H, W);
@@ -435,17 +447,18 @@ DcvcCpuStatus dcvc_cpu_intra_pipeline_decode(DcvcCpuIntraPipeline* p,
                     p->params, 1, p->N, p->yH, p->yW);
     if (st != DCVC_CPU_OK) return st;
     st = run_engine(p->eng_prior_fusion, p->params, 1, p->N, p->yH, p->yW,
-                    p->params_fusion, 1, 2 * p->N + 2, p->yH, p->yW);
+                    p->params_fusion, 1, 2 * p->N, p->yH, p->yW);
     if (st != DCVC_CPU_OK) return st;
 
     /* AR codec decode */
     st = dcvc_cpu_ar_codec_decode_y(p->ar_codec, p->params_fusion,
+                                     p->qyenc, p->qydec,
                                      p->yH, p->yW, y_payload, y_payload_size, p->y_hat);
     if (st != DCVC_CPU_OK) return st;
 
     /* Synthesis + color conversion, then crop to original HxW RGB */
     st = run_engine2(p->eng_synthesis, p->y_hat, 1, p->N, p->yH, p->yW,
-                     p->qdec, 1, 368, 1, 1,
+                     p->qdec, 1, 384, 1, 1,
                      p->x_ycbcr, 1, 3, Hp, Wp);
     if (st != DCVC_CPU_OK) return st;
     ycbcr_to_rgb(p->x_ycbcr, p->x_hat, Hp * Wp);

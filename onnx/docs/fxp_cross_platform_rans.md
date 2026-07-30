@@ -56,20 +56,20 @@ Do **not** send sync side-info. Make both sides compute the **same integers**:
 
 Three layers:
 
-| Layer | Mechanism | Role |
-|-------|-----------|------|
-| A. FXP custom ops | Integer MAC inside entropy (and inter) nets | Same prior tensors on every OS/CPU |
-| B. Integer scale index | Shared Q18→Q12→table rule | Same CDF choice given the same floats |
-| C. rANS guards | Bounded scan, `bytes_consumed`, optional CRC | Fail loud if anything still diverges |
+| Layer                  | Mechanism                                    | Role                                  |
+| ---------------------- | -------------------------------------------- | ------------------------------------- |
+| A. FXP custom ops      | Integer MAC inside entropy (and inter) nets  | Same prior tensors on every OS/CPU    |
+| B. Integer scale index | Shared Q18→Q12→table rule                    | Same CDF choice given the same floats |
+| C. rANS guards         | Bounded scan, `bytes_consumed`, optional CRC | Fail loud if anything still diverges  |
 
 ## 3. Layer A — `com.dcvc` fixed-point ops
 
 Registered with ORT as domain `com.dcvc` (`src/fxp/ort_custom_ops.cpp`).
 
-| Op | Role |
-|----|------|
+| Op                       | Role                                                                                                      |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `FxpConv` / `FxpConv1x1` | Quantize activations with per-tensor `x_scale` → int16; int16 weights; int64 accumulate; dequant to float |
-| `FxpWsRelu` | WSiLU via 65536-entry float LUT (deterministic lookup / lerp) |
+| `FxpWsRelu`              | WSiLU via 65536-entry float LUT (deterministic lookup / lerp)                                             |
 
 Why this kills cross-platform drift:
 
@@ -123,13 +123,13 @@ conceal (e.g. reuse previous frame) on that status.
 
 ## 6. What we measured
 
-| Check | Result |
-|-------|--------|
-| FP32 Windows → Linux (akiyo 10f) | Fail `entropy_sync` at frame 3 |
+| Check                                           | Result                                                            |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| FP32 Windows → Linux (akiyo 10f)                | Fail `entropy_sync` at frame 3                                    |
 | FXP Windows → Linux (same content, FXP package) | **DECODE PASS**; bitstream **byte-identical** to Linux FXP encode |
-| FXP IntraOp threads 1 / 8 / 16 | Bitstreams identical |
-| FXP vs FP32 RD (akiyo 10×256² qp 32) | ~**+1.1%** bytes, ~**−0.07 dB** PSNR |
-| I-frame-only FXP entropy (UVG 256², earlier) | ~**1.000×** bitrate, ~0 dB ΔPSNR |
+| FXP IntraOp threads 1 / 8 / 16                  | Bitstreams identical                                              |
+| FXP vs FP32 RD (akiyo 10×256² qp 32)            | ~**+1.1%** bytes, ~**−0.07 dB** PSNR                              |
+| I-frame-only FXP entropy (UVG 256², earlier)    | ~**1.000×** bitrate, ~0 dB ΔPSNR                                  |
 
 Cost is dominated by CPU FXP kernel time (custom int MAC vs ORT FP32 Conv), not
 by bitrate. Further speed work should stay on ORT ParallelFor + less float
